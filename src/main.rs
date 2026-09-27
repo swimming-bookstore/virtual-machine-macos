@@ -12,11 +12,15 @@
 //!   vmagent --dir /tmp/vm --image debian.raw --user-data cloud-init/user-data
 //!   vmagent ssh --dir /tmp/vm debian@vm
 //!   vmagent scp --dir /tmp/vm ./hello debian@vm:hello
+//!   vmagent run --dir /tmp/vm uname -a
+//!   vmagent read --dir /tmp/vm /etc/os-release --offset 1 --limit 20
+//!   vmagent write --dir /tmp/vm /tmp/hello --file ./hello
+//!   vmagent edit --dir /tmp/vm /tmp/hello --old 'hello' --new 'hello world'
 //!
 //! Apple silicon, macOS 13+.
 
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -71,6 +75,58 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Run a command in the guest. Prints stdout and stderr.
+    Run {
+        #[arg(long)]
+        dir: PathBuf,
+        /// Run as root.
+        #[arg(long)]
+        sudo: bool,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Print a guest file. `--offset` is the 1-based start line.
+    Read {
+        #[arg(long)]
+        dir: PathBuf,
+        /// Read as root.
+        #[arg(long)]
+        sudo: bool,
+        path: String,
+        /// Line to start at (1-based).
+        #[arg(long, default_value_t = 1)]
+        offset: usize,
+        /// Maximum number of lines.
+        #[arg(long, default_value_t = 2000)]
+        limit: usize,
+    },
+    /// Create or overwrite a guest file. Parent directories are created.
+    Write {
+        #[arg(long)]
+        dir: PathBuf,
+        /// Write as root.
+        #[arg(long)]
+        sudo: bool,
+        path: String,
+        /// Local file to write. Omit to read contents from stdin.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Replace one exact block of text in a guest file. `--old` must match once.
+    Edit {
+        #[arg(long)]
+        dir: PathBuf,
+        /// Edit as root.
+        #[arg(long)]
+        sudo: bool,
+        path: String,
+        /// Exact text to replace. Must occur once.
+        #[arg(long)]
+        old: String,
+        /// Replacement text.
+        #[arg(long)]
+        new: String,
+    },
 }
 
 fn main() {
@@ -79,6 +135,22 @@ fn main() {
         match cmd {
             Cmd::Ssh { dir, args } => ssh_cmd(&dir, &args),
             Cmd::Scp { dir, args } => scp_cmd(&dir, &args),
+            Cmd::Run { dir, sudo, command } => run_cmd(&dir, sudo, &command),
+            Cmd::Read {
+                dir,
+                sudo,
+                path,
+                offset,
+                limit,
+            } => read_cmd(&dir, sudo, &path, offset, limit),
+            Cmd::Write { dir, sudo, path, file } => write_cmd(&dir, sudo, &path, file.as_deref()),
+            Cmd::Edit {
+                dir,
+                sudo,
+                path,
+                old,
+                new,
+            } => edit_cmd(&dir, sudo, &path, &old, &new),
         }
     }
 
@@ -280,6 +352,102 @@ fn run_ssh_tool(tool: &str, dir: &Path, args: &[String]) -> ! {
     std::process::exit(status.code().unwrap_or(1));
 }
 
+/// Shell-quote one argument for the remote `sh -c`.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn guest_target(dir: &Path) -> String {
+    format!("debian@{}", guest_ip(&mac_for_dir(dir)))
+}
+
+/// `sh -c` as `debian`. `--sudo` prefixes `sudo`.
+fn remote_shell(sudo: bool, command: &str) -> String {
+    let inner = format!("sh -c {}", sh_quote(command));
+    if sudo {
+        format!("sudo {inner}")
+    } else {
+        inner
+    }
+}
+
+fn run_cmd(dir: &Path, sudo: bool, command: &[String]) -> ! {
+    if command.is_empty() {
+        die("run needs a command");
+    }
+    ssh_run(dir, sudo, &command.join(" "));
+}
+
+fn ssh_run(dir: &Path, sudo: bool, command: &str) -> ! {
+    let status = Command::new("ssh")
+        .args(ssh_base())
+        .arg(guest_target(dir))
+        .arg(remote_shell(sudo, command))
+        .status()
+        .unwrap_or_else(|e| die(&format!("cannot run ssh: {e}")));
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Print a slice of a guest file. The file is not copied to the host.
+fn read_cmd(dir: &Path, sudo: bool, path: &str, offset: usize, limit: usize) -> ! {
+    if offset == 0 {
+        die("--offset starts at 1");
+    }
+    let end = offset + limit - 1;
+    ssh_run(dir, sudo, &format!("sed -n '{offset},{end}p' {}", sh_quote(path)));
+}
+
+/// Create or overwrite a guest file. Parent directories are created.
+fn write_cmd(dir: &Path, sudo: bool, path: &str, file: Option<&Path>) -> ! {
+    let mut bytes = Vec::new();
+    match file {
+        Some(p) => File::open(p)
+            .and_then(|mut f| f.read_to_end(&mut bytes))
+            .unwrap_or_else(|e| die(&format!("cannot read {}: {e}", p.display()))),
+        None => std::io::stdin()
+            .read_to_end(&mut bytes)
+            .unwrap_or_else(|e| die(&format!("cannot read stdin: {e}"))),
+    };
+    let parent = match path.rfind('/') {
+        Some(0) | None => None,
+        Some(i) => Some(&path[..i]),
+    };
+    let script = match parent {
+        Some(p) => format!("mkdir -p {} && cat > {}", sh_quote(p), sh_quote(path)),
+        None => format!("cat > {}", sh_quote(path)),
+    };
+    let mut child = Command::new("ssh")
+        .args(ssh_base())
+        .arg(guest_target(dir))
+        .arg(remote_shell(sudo, &script))
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| die(&format!("cannot run ssh: {e}")));
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap_or_else(|e| die(&format!("cannot send file: {e}")));
+    let status = child.wait().unwrap_or_else(|e| die(&format!("ssh failed: {e}")));
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Replace the one occurrence of `--old` with `--new`.
+fn edit_cmd(dir: &Path, sudo: bool, path: &str, old: &str, new: &str) -> ! {
+    if old.is_empty() {
+        die("--old must not be empty");
+    }
+    let script = format!(
+        "python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); t=p.read_text(); o=sys.argv[2]; n=t.count(o);\n\
+         assert n==1, f\"old matched {{n}} times\"; p.write_text(t.replace(o, sys.argv[3], 1))' {} {} {}",
+        sh_quote(path),
+        sh_quote(old),
+        sh_quote(new)
+    );
+    ssh_run(dir, sudo, &script);
+}
+
 /// Pull vmlinuz, initrd, and the grub root= line out of the disk.
 fn split_image(disk: &Path, dir: &Path, append: &str) -> String {
     let script = find_script();
@@ -423,6 +591,14 @@ mod tests {
         assert_eq!(rewrite_vm("debian@vm:hello", "192.168.64.2"), "debian@192.168.64.2:hello");
         assert_eq!(rewrite_vm("./hello", "192.168.64.2"), "./hello");
         assert_eq!(rewrite_vm("debian@other:x", "192.168.64.2"), "debian@other:x");
+    }
+
+    #[test]
+    fn quotes_for_remote_shell() {
+        assert_eq!(sh_quote("ok"), "'ok'");
+        assert_eq!(sh_quote("a'b"), "'a'\\''b'");
+        assert_eq!(remote_shell(false, "id"), "sh -c 'id'");
+        assert_eq!(remote_shell(true, "id"), "sudo sh -c 'id'");
     }
 
     #[test]

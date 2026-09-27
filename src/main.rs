@@ -19,11 +19,13 @@
 //!   vmagent attach --dir /tmp/vm
 //!   vmagent stop --dir /tmp/vm
 //!
-//! Apple silicon, macOS 13+.
+//! The guest is started in its own session. Closing the window or the terminal
+//! leaves it running. `attach` opens the window again. `stop` kills it.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use clap::{Parser, Subcommand};
@@ -211,8 +213,13 @@ fn main() {
     }
     let mac = mac_for_dir(&dir);
     eprintln!("ssh: vmagent ssh --dir {} debian@vm", dir.display());
-    eprintln!("close the window to keep running; attach to open it again");
+    eprintln!("close the window or this terminal; attach to open the window again");
 
+    let log = File::create(dir.join("vm.log"))
+        .unwrap_or_else(|e| die(&format!("cannot write log: {e}")));
+    let err = log
+        .try_clone()
+        .unwrap_or_else(|e| die(&format!("cannot write log: {e}")));
     let mut cmd = Command::new(&vmcore);
     cmd.env("VM_MAC", &mac);
     cmd.arg(&disk)
@@ -224,17 +231,22 @@ fn main() {
     if let Some(cloud_init) = &cloud_init {
         cmd.arg(cloud_init);
     }
-    let status = cmd
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+    // Own session so Ctrl+C in this terminal does not kill the guest.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err));
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    match cmd.spawn() {
+        Ok(_) => {}
         Err(e) => die(&format!("failed to run {}: {e}", vmcore.display())),
     }
+    eprintln!("guest started in the background");
+    eprintln!("log: {}", dir.join("vm.log").display());
 }
 
 /// Same directory always gets the same locally-administered MAC.

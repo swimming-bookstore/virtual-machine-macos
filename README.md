@@ -13,11 +13,11 @@ bin/vmagent --image images/debian.raw \
   --dir /tmp/vm
 ```
 
-A window opens with the guest console. The disk is not booted through GRUB. `vmagent` splits `vmlinuz` and `initrd.img` out of `/boot` and `vmcore` starts them with `VZLinuxBootLoader`. The kernel file Debian ships is already an uncompressed ARM64 Image (it also has an EFI stub). `root=` is copied from `grub.cfg`. Closing the window leaves the guest running. The working disk, kernel, and initrd are under `/tmp/vmagent-<time>` unless you pass `--dir`.
+The guest starts in the background. A window opens with the console. The disk is not booted through GRUB. `vmagent` splits `vmlinuz` and `initrd.img` out of `/boot` and `vmcore` starts them with `VZLinuxBootLoader`. The kernel file Debian ships is already an uncompressed ARM64 Image (it also has an EFI stub). `root=` is copied from `grub.cfg`. Closing the window, or Ctrl+C in the terminal that started it, leaves the guest running. The working disk, kernel, and initrd are under `/tmp/vmagent-<time>` unless you pass `--dir`.
 
 The generic image has no default password. `--user-data` attaches a disk labeled `cidata` and points cloud-init at it from the kernel command line. `user-data` must start with `#cloud-config`. Cloud-init applies it once per `instance-id`. `cloud-init/user-data` creates `debian` / `debian` and starts sshd. Each `--dir` gets a stable MAC. `ssh` and `scp` look that MAC up in the ARP cache and replace `vm` with the guest address.
 
-Leave the window open. On a fresh disk, wait about a minute for cloud-init to install sshd. Password is `debian`.
+On a fresh disk, wait about a minute for cloud-init to install sshd. Password is `debian`. The start command returns immediately. Console output goes to `vm.log` in `--dir`.
 
 ```bash
 bin/vmagent ssh --dir /tmp/vm debian@vm
@@ -28,7 +28,7 @@ bin/vmagent ssh --dir /tmp/vm debian@vm cat /tmp/hello
 
 `no address` means the guest is not up yet. The MAC for `--dir` is matched against `arp -an`. ARP is many IPs; the MAC picks this VM.
 
-`attach` opens the window again. `stop` kills the VM. The terminal that started it has to stay open.
+`attach` opens the window again. `stop` kills the VM. The guest keeps running after the terminal exits.
 
 ```bash
 bin/vmagent attach --dir /tmp/vm

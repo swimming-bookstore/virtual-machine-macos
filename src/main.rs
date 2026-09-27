@@ -28,6 +28,10 @@ use std::path::{Path, PathBuf};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
+extern "C" {
+    fn setsid() -> i32;
+}
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -237,7 +241,7 @@ fn main() {
         .stderr(Stdio::from(err));
     unsafe {
         cmd.pre_exec(|| {
-            libc::setsid();
+            setsid();
             Ok(())
         });
     }

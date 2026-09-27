@@ -80,8 +80,6 @@ func removePid() {
     try? FileManager.default.removeItem(at: pidURL)
 }
 
-var showSignal: DispatchSourceSignal?
-
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: NSWindow!
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -142,5 +140,4 @@ signal(SIGUSR1, SIG_IGN)
 let src = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
 src.setEventHandler { appDelegate.showWindow() }
 src.resume()
-showSignal = src
 app.run()

@@ -15,7 +15,7 @@ bin/vmagent --image images/debian.raw \
 
 A window opens with the guest console. The disk is not booted through GRUB. `vmagent` splits `vmlinuz` and `initrd.img` out of `/boot` and `vmcore` starts them with `VZLinuxBootLoader`. The kernel file Debian ships is already an uncompressed ARM64 Image (it also has an EFI stub). `root=` is copied from `grub.cfg`. Close the window to stop. The working disk, kernel, and initrd are under `/tmp/vmagent-<time>` unless you pass `--dir`.
 
-The generic image has no default password. `--user-data` attaches a disk labeled `cidata` and points cloud-init at it from the kernel command line. `user-data` must start with `#cloud-config`. Cloud-init applies it once per `instance-id`. `cloud-init/user-data` creates `debian` / `debian` and starts sshd. Each VM gets its own MAC, written to `<dir>/ssh.mac`. `ssh` and `scp` look that MAC up in the DHCP leases and replace `vm` with the guest address.
+The generic image has no default password. `--user-data` attaches a disk labeled `cidata` and points cloud-init at it from the kernel command line. `user-data` must start with `#cloud-config`. Cloud-init applies it once per `instance-id`. `cloud-init/user-data` creates `debian` / `debian` and starts sshd. Each `--dir` gets a stable MAC. `ssh` and `scp` look that MAC up in the ARP cache and replace `vm` with the guest address.
 
 Leave the window open. On a fresh disk, wait about a minute for cloud-init to install sshd. Password is `debian`.
 
@@ -26,4 +26,4 @@ bin/vmagent scp --dir /tmp/vm /tmp/hello debian@vm:/tmp/hello
 bin/vmagent ssh --dir /tmp/vm debian@vm cat /tmp/hello
 ```
 
-`no DHCP lease` means the guest is not up yet. The lease is in `/var/db/dhcpd_leases`, matched against `/tmp/vm/ssh.mac`.
+`no address` means the guest is not up yet. The MAC for `--dir` is matched against `arp -an`. ARP is many IPs; the MAC picks this VM.

@@ -16,13 +16,21 @@
 //!   vmagent read --dir /tmp/vm /etc/os-release --offset 1 --limit 20
 //!   vmagent write --dir /tmp/vm /tmp/hello --file ./hello
 //!   vmagent edit --dir /tmp/vm /tmp/hello --old 'hello' --new 'hello world'
+//!   vmagent attach --dir /tmp/vm
+//!   vmagent stop --dir /tmp/vm
 //!
-//! Apple silicon, macOS 13+.
+//! The guest is started in its own session. Closing the window or the terminal
+//! leaves it running. `attach` opens the window again. `stop` kills it.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+
+extern "C" {
+    fn setsid() -> i32;
+}
 
 use clap::{Parser, Subcommand};
 
@@ -127,6 +135,16 @@ enum Cmd {
         #[arg(long)]
         new: String,
     },
+    /// Open the console window again. The guest keeps running if the window was closed.
+    Attach {
+        #[arg(long)]
+        dir: PathBuf,
+    },
+    /// Stop the VM. This is a hard stop, not a guest shutdown.
+    Stop {
+        #[arg(long)]
+        dir: PathBuf,
+    },
 }
 
 fn main() {
@@ -151,6 +169,8 @@ fn main() {
                 old,
                 new,
             } => edit_cmd(&dir, sudo, &path, &old, &new),
+            Cmd::Attach { dir } => signal_vm(&dir, "-USR1"),
+            Cmd::Stop { dir } => signal_vm(&dir, "-TERM"),
         }
     }
 
@@ -163,6 +183,9 @@ fn main() {
     }
 
     let dir = cli.dir.unwrap_or_else(tmp_dir);
+    if vm_alive(&dir) {
+        die("already running; attach to open the window");
+    }
     if let Err(e) = fs::create_dir_all(&dir) {
         die(&format!("cannot create {}: {e}", dir.display()));
     }
@@ -194,8 +217,13 @@ fn main() {
     }
     let mac = mac_for_dir(&dir);
     eprintln!("ssh: vmagent ssh --dir {} debian@vm", dir.display());
-    eprintln!("close the window to stop");
+    eprintln!("close the window or this terminal; attach to open the window again");
 
+    let log = File::create(dir.join("vm.log"))
+        .unwrap_or_else(|e| die(&format!("cannot write log: {e}")));
+    let err = log
+        .try_clone()
+        .unwrap_or_else(|e| die(&format!("cannot write log: {e}")));
     let mut cmd = Command::new(&vmcore);
     cmd.env("VM_MAC", &mac);
     cmd.arg(&disk)
@@ -207,17 +235,22 @@ fn main() {
     if let Some(cloud_init) = &cloud_init {
         cmd.arg(cloud_init);
     }
-    let status = cmd
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+    // Own session so Ctrl+C in this terminal does not kill the guest.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err));
+    unsafe {
+        cmd.pre_exec(|| {
+            setsid();
+            Ok(())
+        });
+    }
+    match cmd.spawn() {
+        Ok(_) => {}
         Err(e) => die(&format!("failed to run {}: {e}", vmcore.display())),
     }
+    eprintln!("guest started in the background");
+    eprintln!("log: {}", dir.join("vm.log").display());
 }
 
 /// Same directory always gets the same locally-administered MAC.
@@ -574,6 +607,41 @@ fn find_vmcore() -> PathBuf {
         }
     }
     PathBuf::from("bin/vmcore")
+}
+
+fn pid_file(dir: &Path) -> PathBuf {
+    dir.join("vm.pid")
+}
+
+fn vm_pid(dir: &Path) -> u32 {
+    let text = fs::read_to_string(pid_file(dir)).unwrap_or_else(|_| die("vm is not running"));
+    text.trim().parse().unwrap_or_else(|_| die("bad vm.pid"))
+}
+
+fn vm_alive(dir: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(pid_file(dir)) else {
+        return false;
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return false;
+    };
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn signal_vm(dir: &Path, sig: &str) -> ! {
+    let pid = vm_pid(dir);
+    if !vm_alive(dir) {
+        die("vm is not running");
+    }
+    let status = Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .status()
+        .unwrap_or_else(|e| die(&format!("cannot signal vm: {e}")));
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn die(msg: &str) -> ! {

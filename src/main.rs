@@ -18,9 +18,11 @@
 //!   vmagent edit --dir /tmp/vm /tmp/hello --old 'hello' --new 'hello world'
 //!   vmagent attach --dir /tmp/vm
 //!   vmagent stop --dir /tmp/vm
+//!   vmagent list
 //!
 //! The guest is started in its own session. Closing the window or the terminal
 //! leaves it running. `attach` opens the window again. `stop` kills it.
+//! `list` prints the directory of each running `vmcore`. No registry file.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -145,6 +147,8 @@ enum Cmd {
         #[arg(long)]
         dir: PathBuf,
     },
+    /// Print directories of VMs that are still running.
+    List,
 }
 
 fn main() {
@@ -171,6 +175,7 @@ fn main() {
             } => edit_cmd(&dir, sudo, &path, &old, &new),
             Cmd::Attach { dir } => signal_vm(&dir, "-USR1"),
             Cmd::Stop { dir } => signal_vm(&dir, "-TERM"),
+            Cmd::List => list_cmd(),
         }
     }
 
@@ -613,23 +618,61 @@ fn pid_file(dir: &Path) -> PathBuf {
     dir.join("vm.pid")
 }
 
+fn list_cmd() -> ! {
+    let out = Command::new("ps")
+        .args(["-axww", "-o", "pid=,command="])
+        .output()
+        .unwrap_or_else(|e| die(&format!("ps failed: {e}")));
+    if !out.status.success() {
+        die("ps failed");
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut seen = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        let Some(dir) = vm_dir_from_ps(line) else {
+            continue;
+        };
+        // One process, one line. Canonicalize only to drop a second spelling.
+        let key = fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if seen.insert(key) {
+            println!("{}", dir.display());
+        }
+    }
+    std::process::exit(0);
+}
+
+/// `ps` line: pid, vmcore path, disk.img, then the rest of the boot args.
+fn vm_dir_from_ps(line: &str) -> Option<PathBuf> {
+    let mut parts = line.split_whitespace();
+    let _pid = parts.next()?;
+    let bin = parts.next()?;
+    if Path::new(bin).file_name()?.to_str()? != "vmcore" {
+        return None;
+    }
+    let disk = parts.next()?;
+    if !disk.ends_with("disk.img") {
+        return None;
+    }
+    Path::new(disk).parent().map(|p| p.to_path_buf())
+}
+
 fn vm_pid(dir: &Path) -> u32 {
     let text = fs::read_to_string(pid_file(dir)).unwrap_or_else(|_| die("vm is not running"));
     text.trim().parse().unwrap_or_else(|_| die("bad vm.pid"))
 }
 
-fn vm_alive(dir: &Path) -> bool {
-    let Ok(text) = fs::read_to_string(pid_file(dir)) else {
-        return false;
-    };
-    let Ok(pid) = text.trim().parse::<u32>() else {
-        return false;
-    };
-    Command::new("kill")
+fn live_pid(dir: &Path) -> Option<u32> {
+    let pid: u32 = fs::read_to_string(pid_file(dir)).ok()?.trim().parse().ok()?;
+    let alive = Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()
         .map(|s| s.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if alive { Some(pid) } else { None }
+}
+
+fn vm_alive(dir: &Path) -> bool {
+    live_pid(dir).is_some()
 }
 
 fn signal_vm(dir: &Path, sig: &str) -> ! {
@@ -639,8 +682,14 @@ fn signal_vm(dir: &Path, sig: &str) -> ! {
     }
     let status = Command::new("kill")
         .args([sig, &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .unwrap_or_else(|e| die(&format!("cannot signal vm: {e}")));
+    // SIGTERM can reap the process before kill runs. That is a stop, not an error.
+    if sig == "-TERM" && !vm_alive(dir) {
+        std::process::exit(0);
+    }
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -686,6 +735,14 @@ mod tests {
         let first = u8::from_str_radix(&n[..2], 16).unwrap();
         assert_eq!(first & 1, 0);
         assert_eq!(first & 2, 2);
+    }
+
+    #[test]
+    fn reads_vm_dir_from_ps() {
+        let line = "  2585 /usr/local/bin/vmcore /tmp/vm/disk.img /tmp/vm/vmlinuz /tmp/vm/initrd root=LABEL=root 2 2048";
+        assert_eq!(vm_dir_from_ps(line).unwrap(), PathBuf::from("/tmp/vm"));
+        assert!(vm_dir_from_ps("  1 /bin/launchd").is_none());
+        assert!(vm_dir_from_ps("  9 /tmp/vmcore /tmp/other.img").is_none());
     }
 
     #[test]

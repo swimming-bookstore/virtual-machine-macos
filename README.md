@@ -28,9 +28,10 @@ bin/vmagent ssh --dir /tmp/vm debian@vm cat /tmp/hello
 
 `no address` means the guest is not up yet. The MAC for `--dir` is matched against `arp -an`. ARP is many IPs; the MAC picks this VM.
 
-`attach` opens the window again. `stop` kills the VM. The guest keeps running after the terminal exits.
+`attach` opens the window again. `stop` kills the VM. `list` asks `ps` for running `vmcore` processes and prints each disk's directory. There is no registry file, so a VM that is already running is listed, and `/tmp` and `/private/tmp` are not two entries. The guest keeps running after the terminal exits.
 
 ```bash
+bin/vmagent list
 bin/vmagent attach --dir /tmp/vm
 bin/vmagent stop --dir /tmp/vm
 ```

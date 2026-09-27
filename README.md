@@ -27,3 +27,12 @@ bin/vmagent ssh --dir /tmp/vm debian@vm cat /tmp/hello
 ```
 
 `no address` means the guest is not up yet. The MAC for `--dir` is matched against `arp -an`. ARP is many IPs; the MAC picks this VM.
+
+`run`, `read`, `write`, and `edit` use that ssh session as `debian`. `--sudo` runs as root.
+
+```bash
+bin/vmagent run --dir /tmp/vm uname -a
+bin/vmagent read --dir /tmp/vm /etc/os-release --offset 1 --limit 20
+bin/vmagent write --dir /tmp/vm /tmp/hello --file ./hello
+bin/vmagent edit --dir /tmp/vm /tmp/hello --old 'hello' --new 'hello world'
+```

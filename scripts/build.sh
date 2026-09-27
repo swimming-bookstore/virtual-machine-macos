@@ -7,4 +7,5 @@ codesign --force --sign - --entitlements vmcore/vmcore.entitlements bin/vmcore
 cp scripts/split-image.py bin/split-image.py
 cargo build --release
 cp target/release/vmagent bin/vmagent
+codesign --force --sign - bin/vmagent
 echo "built bin/vmagent and bin/vmcore"

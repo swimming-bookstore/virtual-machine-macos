@@ -6,6 +6,13 @@
 //!
 //!   vmagent --image debian.raw --user-data cloud-init/user-data --meta-data cloud-init/meta-data
 //!
+//! `ssh` and `scp` wrap the host tools. `user@vm` is the guest. The wrapper
+//! derives the MAC from `--dir` and looks up that address in ARP. sshd listens on port 22.
+//!
+//!   vmagent --dir /tmp/vm --image debian.raw --user-data cloud-init/user-data
+//!   vmagent ssh --dir /tmp/vm debian@vm
+//!   vmagent scp --dir /tmp/vm ./hello debian@vm:hello
+//!
 //! Apple silicon, macOS 13+.
 
 use std::fs::{self, File};
@@ -13,14 +20,18 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "vmagent", version, about = "Boot a Debian cloud image on macOS")]
+#[command(subcommand_negates_reqs = true)]
 struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+
     /// Path to a Debian generic raw image (arm64 on Apple silicon).
-    #[arg(long)]
-    image: PathBuf,
+    #[arg(long, required = true)]
+    image: Option<PathBuf>,
 
     /// Where the working disk, kernel, and initrd go.
     /// Defaults to a new directory under /tmp.
@@ -42,32 +53,62 @@ struct Cli {
     mem_mb: u64,
 }
 
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run ssh against the VM in `--dir`. Use `user@vm` for the guest.
+    Ssh {
+        #[arg(long)]
+        dir: PathBuf,
+        /// Arguments passed to ssh after the connection options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run scp against the VM in `--dir`. Use `user@vm:path` for the guest.
+    Scp {
+        #[arg(long)]
+        dir: PathBuf,
+        /// Arguments passed to scp after the connection options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
+    if let Some(cmd) = cli.cmd {
+        match cmd {
+            Cmd::Ssh { dir, args } => ssh_cmd(&dir, &args),
+            Cmd::Scp { dir, args } => scp_cmd(&dir, &args),
+        }
+    }
 
     if !cfg!(target_os = "macos") {
         die("this only runs on macOS");
     }
-    if !cli.image.is_file() {
-        die(&format!("image not found: {}", cli.image.display()));
+    let image = cli.image.unwrap_or_else(|| die("--image is required"));
+    if !image.is_file() {
+        die(&format!("image not found: {}", image.display()));
     }
 
     let dir = cli.dir.unwrap_or_else(tmp_dir);
     if let Err(e) = fs::create_dir_all(&dir) {
         die(&format!("cannot create {}: {e}", dir.display()));
     }
-
     let disk = dir.join("disk.img");
     if !disk.exists() {
         eprintln!("copying image to {}", disk.display());
-        if let Err(e) = fs::copy(&cli.image, &disk) {
+        if let Err(e) = fs::copy(&image, &disk) {
             die(&format!("copy failed: {e}"));
         }
     }
 
     let cloud_init = match (&cli.user_data, &cli.meta_data) {
         (None, None) => None,
-        _ => Some(write_cidata(&dir, cli.user_data.as_deref(), cli.meta_data.as_deref())),
+        _ => Some(write_cidata(
+            &dir,
+            cli.user_data.as_deref(),
+            cli.meta_data.as_deref(),
+        )),
     };
 
     let append = if cloud_init.is_some() { "ds=nocloud" } else { "" };
@@ -79,9 +120,12 @@ fn main() {
     if cloud_init.is_none() {
         eprintln!("no user-data: the generic image has no default login");
     }
+    let mac = mac_for_dir(&dir);
+    eprintln!("ssh: vmagent ssh --dir {} debian@vm", dir.display());
     eprintln!("close the window to stop");
 
     let mut cmd = Command::new(&vmcore);
+    cmd.env("VM_MAC", &mac);
     cmd.arg(&disk)
         .arg(dir.join("vmlinuz"))
         .arg(dir.join("initrd"))
@@ -102,6 +146,138 @@ fn main() {
         Ok(s) => std::process::exit(s.code().unwrap_or(1)),
         Err(e) => die(&format!("failed to run {}: {e}", vmcore.display())),
     }
+}
+
+/// Same directory always gets the same locally-administered MAC.
+fn mac_for_dir(dir: &Path) -> String {
+    let path = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in path.to_string_lossy().as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let bytes = [
+        ((h >> 40) as u8 & 0xfe) | 0x02,
+        (h >> 32) as u8,
+        (h >> 24) as u8,
+        (h >> 16) as u8,
+        (h >> 8) as u8,
+        h as u8,
+    ];
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+    )
+}
+
+#[cfg(test)]
+fn is_mac(mac: &str) -> bool {
+    normalize_mac(mac).is_some()
+}
+
+/// Lowercase, colon-separated, two digits per octet. ARP omits leading zeros.
+fn normalize_mac(mac: &str) -> Option<String> {
+    let parts: Vec<&str> = mac.split(|c| c == ':' || c == '-').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut out = String::with_capacity(17);
+    for (i, p) in parts.iter().enumerate() {
+        if p.is_empty() || p.len() > 2 || !p.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        if i > 0 {
+            out.push(':');
+        }
+        if p.len() == 1 {
+            out.push('0');
+        }
+        out.push_str(&p.to_ascii_lowercase());
+    }
+    Some(out)
+}
+
+fn ip_from_arp(text: &str, wanted: &str) -> Option<String> {
+    for line in text.lines() {
+        let Some((before, after)) = line.split_once(") at ") else {
+            continue;
+        };
+        let Some((_, ip)) = before.rsplit_once('(') else {
+            continue;
+        };
+        let Some(mac_part) = after.split_whitespace().next() else {
+            continue;
+        };
+        if mac_part.eq_ignore_ascii_case("(incomplete)") {
+            continue;
+        }
+        if normalize_mac(mac_part).as_deref() == Some(wanted) {
+            return Some(ip.to_string());
+        }
+    }
+    None
+}
+
+/// Guest address from the ARP cache. ARP is IP→MAC; the MAC picks this VM.
+fn guest_ip(mac: &str) -> String {
+    let wanted = normalize_mac(mac).unwrap_or_else(|| die("bad MAC"));
+    let arp = Command::new("arp")
+        .arg("-an")
+        .output()
+        .unwrap_or_else(|e| die(&format!("cannot run arp: {e}")));
+    if arp.status.success() {
+        let text = String::from_utf8_lossy(&arp.stdout);
+        if let Some(ip) = ip_from_arp(&text, &wanted) {
+            return ip;
+        }
+    }
+    die(&format!("no address for {wanted} yet (is the guest up?)"));
+}
+
+fn ssh_base() -> Vec<String> {
+    vec![
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(),
+        "UserKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        "LogLevel=ERROR".into(),
+    ]
+}
+
+/// Replace the dummy host `vm` with the guest address. `user@vm` or `user@vm:path`.
+fn rewrite_vm(tok: &str, ip: &str) -> String {
+    let Some((user, rest)) = tok.split_once('@') else {
+        return tok.to_string();
+    };
+    if user.is_empty() || user.contains(':') {
+        return tok.to_string();
+    }
+    let host = rest.split(':').next().unwrap_or("");
+    if host != "vm" {
+        return tok.to_string();
+    }
+    let suffix = &rest[host.len()..];
+    format!("{user}@{ip}{suffix}")
+}
+
+fn ssh_cmd(dir: &Path, args: &[String]) -> ! {
+    run_ssh_tool("ssh", dir, args);
+}
+
+fn scp_cmd(dir: &Path, args: &[String]) -> ! {
+    run_ssh_tool("scp", dir, args);
+}
+
+fn run_ssh_tool(tool: &str, dir: &Path, args: &[String]) -> ! {
+    let ip = guest_ip(&mac_for_dir(dir));
+    let args: Vec<String> = args.iter().map(|a| rewrite_vm(a, &ip)).collect();
+    let status = Command::new(tool)
+        .args(ssh_base())
+        .args(&args)
+        .status()
+        .unwrap_or_else(|e| die(&format!("cannot run {tool}: {e}")));
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// Pull vmlinuz, initrd, and the grub root= line out of the disk.
@@ -235,4 +411,45 @@ fn find_vmcore() -> PathBuf {
 fn die(msg: &str) -> ! {
     eprintln!("vmagent: {msg}");
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_vm_host() {
+        assert_eq!(rewrite_vm("debian@vm", "192.168.64.2"), "debian@192.168.64.2");
+        assert_eq!(rewrite_vm("debian@vm:hello", "192.168.64.2"), "debian@192.168.64.2:hello");
+        assert_eq!(rewrite_vm("./hello", "192.168.64.2"), "./hello");
+        assert_eq!(rewrite_vm("debian@other:x", "192.168.64.2"), "debian@other:x");
+    }
+
+    #[test]
+    fn parses_mac() {
+        assert!(is_mac("aa:bb:cc:dd:ee:ff"));
+        assert!(is_mac("aa-bb-cc-dd-ee-ff"));
+        assert!(is_mac("36:7c:3:71:7b:5b"));
+        assert!(!is_mac("not-a-mac"));
+    }
+
+    #[test]
+    fn mac_for_dir_is_local_unicast() {
+        let a = mac_for_dir(Path::new("/tmp/vm"));
+        let b = mac_for_dir(Path::new("/tmp/vm"));
+        assert_eq!(a, b);
+        let n = normalize_mac(&a).unwrap();
+        let first = u8::from_str_radix(&n[..2], 16).unwrap();
+        assert_eq!(first & 1, 0);
+        assert_eq!(first & 2, 2);
+    }
+
+    #[test]
+    fn finds_ip_in_arp() {
+        let arp = "? (192.168.64.3) at 36:7c:3:71:7b:5b on bridge100 ifscope [bridge]\n";
+        assert_eq!(
+            ip_from_arp(arp, "36:7c:03:71:7b:5b").as_deref(),
+            Some("192.168.64.3")
+        );
+    }
 }

@@ -2,6 +2,9 @@
 // Usage: vmcore <disk.img> <kernel> <initrd> <cmdline> <cpus> <memory-mb> [cidata.raw]
 // VZLinuxBootLoader takes the kernel command line. The disk is still the root filesystem.
 // A GUI window is required: no serial console on this path.
+//
+// VM_MAC is the Ethernet address. sshd listens on port 22.
+// The host wrapper finds the guest by that MAC in the ARP cache.
 
 import Cocoa
 import Virtualization
@@ -33,6 +36,17 @@ if let cloudInitURL {
 config.storageDevices = storage
 
 let net = VZVirtioNetworkDeviceConfiguration()
+let mac: VZMACAddress
+if let macStr = ProcessInfo.processInfo.environment["VM_MAC"], !macStr.isEmpty {
+    guard let parsed = VZMACAddress(string: macStr) else {
+        fputs("bad VM_MAC: \(macStr)\n", stderr)
+        exit(1)
+    }
+    mac = parsed
+} else {
+    mac = VZMACAddress.randomLocallyAdministered()
+}
+net.macAddress = mac
 net.attachment = VZNATNetworkDeviceAttachment()
 config.networkDevices = [net]
 config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]

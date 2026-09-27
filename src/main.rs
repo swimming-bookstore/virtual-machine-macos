@@ -16,6 +16,8 @@
 //!   vmagent read --dir /tmp/vm /etc/os-release --offset 1 --limit 20
 //!   vmagent write --dir /tmp/vm /tmp/hello --file ./hello
 //!   vmagent edit --dir /tmp/vm /tmp/hello --old 'hello' --new 'hello world'
+//!   vmagent attach --dir /tmp/vm
+//!   vmagent stop --dir /tmp/vm
 //!
 //! Apple silicon, macOS 13+.
 
@@ -127,6 +129,16 @@ enum Cmd {
         #[arg(long)]
         new: String,
     },
+    /// Open the console window again. The guest keeps running if the window was closed.
+    Attach {
+        #[arg(long)]
+        dir: PathBuf,
+    },
+    /// Stop the VM. This is a hard stop, not a guest shutdown.
+    Stop {
+        #[arg(long)]
+        dir: PathBuf,
+    },
 }
 
 fn main() {
@@ -151,6 +163,8 @@ fn main() {
                 old,
                 new,
             } => edit_cmd(&dir, sudo, &path, &old, &new),
+            Cmd::Attach { dir } => signal_vm(&dir, "-USR1"),
+            Cmd::Stop { dir } => signal_vm(&dir, "-TERM"),
         }
     }
 
@@ -163,6 +177,9 @@ fn main() {
     }
 
     let dir = cli.dir.unwrap_or_else(tmp_dir);
+    if vm_alive(&dir) {
+        die("already running; attach to open the window");
+    }
     if let Err(e) = fs::create_dir_all(&dir) {
         die(&format!("cannot create {}: {e}", dir.display()));
     }
@@ -194,7 +211,7 @@ fn main() {
     }
     let mac = mac_for_dir(&dir);
     eprintln!("ssh: vmagent ssh --dir {} debian@vm", dir.display());
-    eprintln!("close the window to stop");
+    eprintln!("close the window to keep running; attach to open it again");
 
     let mut cmd = Command::new(&vmcore);
     cmd.env("VM_MAC", &mac);
@@ -574,6 +591,41 @@ fn find_vmcore() -> PathBuf {
         }
     }
     PathBuf::from("bin/vmcore")
+}
+
+fn pid_file(dir: &Path) -> PathBuf {
+    dir.join("vm.pid")
+}
+
+fn vm_pid(dir: &Path) -> u32 {
+    let text = fs::read_to_string(pid_file(dir)).unwrap_or_else(|_| die("vm is not running"));
+    text.trim().parse().unwrap_or_else(|_| die("bad vm.pid"))
+}
+
+fn vm_alive(dir: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(pid_file(dir)) else {
+        return false;
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return false;
+    };
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn signal_vm(dir: &Path, sig: &str) -> ! {
+    let pid = vm_pid(dir);
+    if !vm_alive(dir) {
+        die("vm is not running");
+    }
+    let status = Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .status()
+        .unwrap_or_else(|e| die(&format!("cannot signal vm: {e}")));
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn die(msg: &str) -> ! {

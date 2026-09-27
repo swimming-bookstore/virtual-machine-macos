@@ -6,6 +6,13 @@
 //!
 //!   vmagent --image debian.raw --user-data cloud-init/user-data --meta-data cloud-init/meta-data
 //!
+//! `ssh` and `scp` wrap the host tools. `user@vm` is the guest. The wrapper
+//! reads the MAC from `--dir` and looks up the DHCP address. sshd listens on port 22.
+//!
+//!   vmagent --dir /tmp/vm --image debian.raw --user-data cloud-init/user-data
+//!   vmagent ssh --dir /tmp/vm debian@vm
+//!   vmagent scp --dir /tmp/vm ./hello debian@vm:hello
+//!
 //! Apple silicon, macOS 13+.
 
 use std::fs::{self, File};
@@ -13,14 +20,17 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "vmagent", version, about = "Boot a Debian cloud image on macOS")]
 struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+
     /// Path to a Debian generic raw image (arm64 on Apple silicon).
-    #[arg(long)]
-    image: PathBuf,
+    #[arg(long, required_unless_present = "cmd")]
+    image: Option<PathBuf>,
 
     /// Where the working disk, kernel, and initrd go.
     /// Defaults to a new directory under /tmp.
@@ -42,32 +52,62 @@ struct Cli {
     mem_mb: u64,
 }
 
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run ssh against the VM in `--dir`. Use `user@vm` for the guest.
+    Ssh {
+        #[arg(long)]
+        dir: PathBuf,
+        /// Arguments passed to ssh after the connection options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run scp against the VM in `--dir`. Use `user@vm:path` for the guest.
+    Scp {
+        #[arg(long)]
+        dir: PathBuf,
+        /// Arguments passed to scp after the connection options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
+    if let Some(cmd) = cli.cmd {
+        match cmd {
+            Cmd::Ssh { dir, args } => ssh_cmd(&dir, &args),
+            Cmd::Scp { dir, args } => scp_cmd(&dir, &args),
+        }
+    }
 
     if !cfg!(target_os = "macos") {
         die("this only runs on macOS");
     }
-    if !cli.image.is_file() {
-        die(&format!("image not found: {}", cli.image.display()));
+    let image = cli.image.unwrap_or_else(|| die("--image is required"));
+    if !image.is_file() {
+        die(&format!("image not found: {}", image.display()));
     }
 
     let dir = cli.dir.unwrap_or_else(tmp_dir);
     if let Err(e) = fs::create_dir_all(&dir) {
         die(&format!("cannot create {}: {e}", dir.display()));
     }
-
     let disk = dir.join("disk.img");
     if !disk.exists() {
         eprintln!("copying image to {}", disk.display());
-        if let Err(e) = fs::copy(&cli.image, &disk) {
+        if let Err(e) = fs::copy(&image, &disk) {
             die(&format!("copy failed: {e}"));
         }
     }
 
     let cloud_init = match (&cli.user_data, &cli.meta_data) {
         (None, None) => None,
-        _ => Some(write_cidata(&dir, cli.user_data.as_deref(), cli.meta_data.as_deref())),
+        _ => Some(write_cidata(
+            &dir,
+            cli.user_data.as_deref(),
+            cli.meta_data.as_deref(),
+        )),
     };
 
     let append = if cloud_init.is_some() { "ds=nocloud" } else { "" };
@@ -79,9 +119,13 @@ fn main() {
     if cloud_init.is_none() {
         eprintln!("no user-data: the generic image has no default login");
     }
+    eprintln!("ssh: vmagent ssh --dir {} debian@vm", dir.display());
     eprintln!("close the window to stop");
 
+    let mac_file = dir.join("ssh.mac");
+    let _ = fs::remove_file(&mac_file);
     let mut cmd = Command::new(&vmcore);
+    cmd.env("VM_SSH_MAC_FILE", &mac_file);
     cmd.arg(&disk)
         .arg(dir.join("vmlinuz"))
         .arg(dir.join("initrd"))
@@ -102,6 +146,109 @@ fn main() {
         Ok(s) => std::process::exit(s.code().unwrap_or(1)),
         Err(e) => die(&format!("failed to run {}: {e}", vmcore.display())),
     }
+}
+
+fn ssh_mac(dir: &Path) -> String {
+    let path = dir.join("ssh.mac");
+    let text = fs::read_to_string(&path).unwrap_or_else(|_| {
+        die(&format!("no MAC in {} (is the VM running?)", dir.display()))
+    });
+    let mac = text.trim();
+    if !is_mac(mac) {
+        die("ssh mac file is not a MAC address");
+    }
+    mac.to_string()
+}
+
+fn is_mac(mac: &str) -> bool {
+    let parts: Vec<&str> = mac.split(':').collect();
+    parts.len() == 6
+        && parts
+            .iter()
+            .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Guest address from Apple's DHCP lease file. The lease matches this VM's MAC.
+fn guest_ip(mac: &str) -> String {
+    let wanted = mac.to_ascii_lowercase();
+    let text = fs::read_to_string("/var/db/dhcpd_leases").unwrap_or_else(|_| {
+        die("no DHCP leases yet (is the guest up?)")
+    });
+    let mut ip: Option<String> = None;
+    let mut hit = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line == "{" {
+            ip = None;
+            hit = false;
+            continue;
+        }
+        if line == "}" {
+            if hit {
+                if let Some(ip) = ip {
+                    return ip;
+                }
+                die(&format!("DHCP lease for {mac} has no address"));
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if key == "ip_address" && !value.is_empty() {
+            ip = Some(value.to_string());
+        } else if key == "hw_address" && value.to_ascii_lowercase().ends_with(&wanted) {
+            hit = true;
+        }
+    }
+    die(&format!("no DHCP lease for {mac} yet (is the guest up?)"));
+}
+
+fn ssh_base() -> Vec<String> {
+    vec![
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(),
+        "UserKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        "LogLevel=ERROR".into(),
+    ]
+}
+
+/// Replace the dummy host `vm` with the guest address. `user@vm` or `user@vm:path`.
+fn rewrite_vm(tok: &str, ip: &str) -> String {
+    let Some((user, rest)) = tok.split_once('@') else {
+        return tok.to_string();
+    };
+    if user.is_empty() || user.contains(':') {
+        return tok.to_string();
+    }
+    let host = rest.split(':').next().unwrap_or("");
+    if host != "vm" {
+        return tok.to_string();
+    }
+    let suffix = &rest[host.len()..];
+    format!("{user}@{ip}{suffix}")
+}
+
+fn ssh_cmd(dir: &Path, args: &[String]) -> ! {
+    run_ssh_tool("ssh", dir, args);
+}
+
+fn scp_cmd(dir: &Path, args: &[String]) -> ! {
+    run_ssh_tool("scp", dir, args);
+}
+
+fn run_ssh_tool(tool: &str, dir: &Path, args: &[String]) -> ! {
+    let ip = guest_ip(&ssh_mac(dir));
+    let args: Vec<String> = args.iter().map(|a| rewrite_vm(a, &ip)).collect();
+    let status = Command::new(tool)
+        .args(ssh_base())
+        .args(&args)
+        .status()
+        .unwrap_or_else(|e| die(&format!("cannot run {tool}: {e}")));
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// Pull vmlinuz, initrd, and the grub root= line out of the disk.
@@ -235,4 +382,24 @@ fn find_vmcore() -> PathBuf {
 fn die(msg: &str) -> ! {
     eprintln!("vmagent: {msg}");
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_vm_host() {
+        assert_eq!(rewrite_vm("debian@vm", "192.168.64.2"), "debian@192.168.64.2");
+        assert_eq!(rewrite_vm("debian@vm:hello", "192.168.64.2"), "debian@192.168.64.2:hello");
+        assert_eq!(rewrite_vm("./hello", "192.168.64.2"), "./hello");
+        assert_eq!(rewrite_vm("debian@other:x", "192.168.64.2"), "debian@other:x");
+    }
+
+    #[test]
+    fn parses_mac() {
+        assert!(is_mac("aa:bb:cc:dd:ee:ff"));
+        assert!(!is_mac("aa-bb-cc-dd-ee-ff"));
+        assert!(!is_mac("not-a-mac"));
+    }
 }

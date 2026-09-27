@@ -10,3 +10,8 @@ users:
 ssh_pwauth: true
 chpasswd:
   expire: false
+package_update: false
+packages:
+  - openssh-server
+runcmd:
+  - systemctl enable --now ssh

@@ -2,6 +2,9 @@
 // Usage: vmcore <disk.img> <kernel> <initrd> <cmdline> <cpus> <memory-mb> [cidata.raw]
 // VZLinuxBootLoader takes the kernel command line. The disk is still the root filesystem.
 // A GUI window is required: no serial console on this path.
+//
+// VM_SSH_MAC_FILE is where this VM's MAC is written. sshd listens on port 22.
+// The host wrapper finds the guest by that MAC in the DHCP leases.
 
 import Cocoa
 import Virtualization
@@ -33,6 +36,8 @@ if let cloudInitURL {
 config.storageDevices = storage
 
 let net = VZVirtioNetworkDeviceConfiguration()
+let mac = VZMACAddress.randomLocallyAdministered()
+net.macAddress = mac
 net.attachment = VZNATNetworkDeviceAttachment()
 config.networkDevices = [net]
 config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
@@ -69,6 +74,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.contentView = view
         window.delegate = self
         window.makeKeyAndOrderFront(nil)
+        if let macFile = ProcessInfo.processInfo.environment["VM_SSH_MAC_FILE"], !macFile.isEmpty {
+            do {
+                try "\(mac.string)\n".write(toFile: macFile, atomically: true, encoding: .utf8)
+            } catch {
+                fputs("ssh: cannot write \(macFile): \(error.localizedDescription)\n", stderr)
+                exit(1)
+            }
+            fputs("ssh mac: \(mac.string)\n", stderr)
+        }
         vm.start { result in
             if case .failure(let err) = result {
                 fputs("start failed: \(err.localizedDescription)\n", stderr)

@@ -67,6 +67,6 @@ These use the same ssh session as `debian`. `--sudo` runs as root.
 ```bash
 bin/vmagent run --dir /tmp/vm uname -a
 bin/vmagent read --dir /tmp/vm /etc/os-release --offset 1 --limit 20
-bin/vmagent write --dir /tmp/vm /tmp/hello --file ./hello
+bin/vmagent write --dir /tmp/vm /tmp/hello --content 'hello'
 bin/vmagent edit --dir /tmp/vm /tmp/hello --old 'hello' --new 'hello world'
 ```

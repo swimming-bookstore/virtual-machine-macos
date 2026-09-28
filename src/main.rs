@@ -14,7 +14,7 @@
 //!   vmagent scp --dir /tmp/vm ./hello debian@vm:hello
 //!   vmagent run --dir /tmp/vm uname -a
 //!   vmagent read --dir /tmp/vm /etc/os-release --offset 1 --limit 20
-//!   vmagent write --dir /tmp/vm /tmp/hello --file ./hello
+//!   vmagent write --dir /tmp/vm /tmp/hello --content hello
 //!   vmagent edit --dir /tmp/vm /tmp/hello --old 'hello' --new 'hello world'
 //!   vmagent attach --dir /tmp/vm
 //!   vmagent stop --dir /tmp/vm
@@ -118,11 +118,11 @@ enum Cmd {
         #[arg(long)]
         sudo: bool,
         path: String,
-        /// Local file to write. Omit to read contents from stdin.
-        #[arg(long)]
-        file: Option<PathBuf>,
+        /// Contents to write. Omit to read from stdin.
+        #[arg(long, allow_hyphen_values = true)]
+        content: Option<String>,
     },
-    /// Replace one exact block of text in a guest file. `--old` must match once.
+    /// Replace exact blocks in a guest file. Each `--old` must match once.
     Edit {
         #[arg(long)]
         dir: PathBuf,
@@ -130,12 +130,12 @@ enum Cmd {
         #[arg(long)]
         sudo: bool,
         path: String,
-        /// Exact text to replace. Must occur once.
-        #[arg(long)]
-        old: String,
-        /// Replacement text.
-        #[arg(long)]
-        new: String,
+        /// Exact text to replace. Repeat with `--new`. Matched against the original file.
+        #[arg(long, action = clap::ArgAction::Append)]
+        old: Vec<String>,
+        /// Replacement for the matching `--old`.
+        #[arg(long, action = clap::ArgAction::Append)]
+        new: Vec<String>,
     },
     /// Open the console window again. The guest keeps running if the window was closed.
     Attach {
@@ -165,7 +165,12 @@ fn main() {
                 offset,
                 limit,
             } => read_cmd(&dir, sudo, &path, offset, limit),
-            Cmd::Write { dir, sudo, path, file } => write_cmd(&dir, sudo, &path, file.as_deref()),
+            Cmd::Write {
+                dir,
+                sudo,
+                path,
+                content,
+            } => write_cmd(&dir, sudo, &path, content.as_deref()),
             Cmd::Edit {
                 dir,
                 sudo,
@@ -426,25 +431,32 @@ fn ssh_run(dir: &Path, sudo: bool, command: &str) -> ! {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// Print a slice of a guest file. The file is not copied to the host.
+/// Print a slice of a guest file. Says when more lines remain.
 fn read_cmd(dir: &Path, sudo: bool, path: &str, offset: usize, limit: usize) -> ! {
     if offset == 0 {
         die("--offset starts at 1");
     }
-    let end = offset + limit - 1;
-    ssh_run(dir, sudo, &format!("sed -n '{offset},{end}p' {}", sh_quote(path)));
+    if limit == 0 {
+        die("--limit must be at least 1");
+    }
+    let script = format!(
+        "awk -v start={offset} -v lim={limit} 'NR>=start && NR<start+lim {{ print }} END {{ if (NR < start) {{ printf \"offset %d is beyond end of file (%d lines total)\\n\", start, NR > \"/dev/stderr\"; exit 1 }} if (start + lim - 1 < NR) printf \"\\n[%d more lines in file. Use offset=%d to continue.]\\n\", NR - (start + lim - 1), start + lim }}' {}",
+        sh_quote(path)
+    );
+    ssh_run(dir, sudo, &script);
 }
 
-/// Create or overwrite a guest file. Parent directories are created.
-fn write_cmd(dir: &Path, sudo: bool, path: &str, file: Option<&Path>) -> ! {
-    let mut bytes = Vec::new();
-    match file {
-        Some(p) => File::open(p)
-            .and_then(|mut f| f.read_to_end(&mut bytes))
-            .unwrap_or_else(|e| die(&format!("cannot read {}: {e}", p.display()))),
-        None => std::io::stdin()
-            .read_to_end(&mut bytes)
-            .unwrap_or_else(|e| die(&format!("cannot read stdin: {e}"))),
+/// Create or overwrite a guest file. `--content` is the file body. Parents are created.
+fn write_cmd(dir: &Path, sudo: bool, path: &str, content: Option<&str>) -> ! {
+    let bytes = match content {
+        Some(text) => text.as_bytes().to_vec(),
+        None => {
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut bytes)
+                .unwrap_or_else(|e| die(&format!("cannot read stdin: {e}")));
+            bytes
+        }
     };
     let parent = match path.rfind('/') {
         Some(0) | None => None,
@@ -471,19 +483,69 @@ fn write_cmd(dir: &Path, sudo: bool, path: &str, file: Option<&Path>) -> ! {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// Replace the one occurrence of `--old` with `--new`.
-fn edit_cmd(dir: &Path, sudo: bool, path: &str, old: &str, new: &str) -> ! {
-    if old.is_empty() {
-        die("--old must not be empty");
+/// Replace each `--old` once. Matches are taken from the original file, then written back.
+fn edit_cmd(dir: &Path, sudo: bool, path: &str, old: &[String], new: &[String]) -> ! {
+    let raw = ssh_capture(dir, sudo, &format!("cat {}", sh_quote(path)));
+    let text = String::from_utf8(raw).unwrap_or_else(|_| die("guest file is not utf-8"));
+    let updated = apply_edits(&text, old, new).unwrap_or_else(|e| die(&e));
+    write_cmd(dir, sudo, path, Some(&updated));
+}
+
+fn ssh_capture(dir: &Path, sudo: bool, command: &str) -> Vec<u8> {
+    let out = Command::new("ssh")
+        .args(ssh_base())
+        .arg(guest_target(dir))
+        .arg(remote_shell(sudo, command))
+        .output()
+        .unwrap_or_else(|e| die(&format!("cannot run ssh: {e}")));
+    if !out.status.success() {
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        die("cannot read guest file");
     }
-    let script = format!(
-        "python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); t=p.read_text(); o=sys.argv[2]; n=t.count(o);\n\
-         assert n==1, f\"old matched {{n}} times\"; p.write_text(t.replace(o, sys.argv[3], 1))' {} {} {}",
-        sh_quote(path),
-        sh_quote(old),
-        sh_quote(new)
-    );
-    ssh_run(dir, sudo, &script);
+    out.stdout
+}
+
+/// Each old text must occur once. Spans must not overlap. Applied against `text`, not each other.
+fn apply_edits(text: &str, old: &[String], new: &[String]) -> Result<String, String> {
+    if old.is_empty() || old.len() != new.len() {
+        return Err("each --old needs a --new".into());
+    }
+    let mut spans = Vec::new();
+    for (old, new) in old.iter().zip(new) {
+        if old.is_empty() {
+            return Err("--old must not be empty".into());
+        }
+        let mut at = 0;
+        let mut found = None;
+        let mut n = 0;
+        while let Some(i) = text[at..].find(old) {
+            n += 1;
+            if found.is_none() {
+                found = Some(at + i);
+            }
+            at += i + old.len();
+        }
+        if n != 1 {
+            return Err(format!("old matched {n} times"));
+        }
+        let start = found.unwrap();
+        spans.push((start, start + old.len(), new.as_str()));
+    }
+    spans.sort_by_key(|s| s.0);
+    for pair in spans.windows(2) {
+        if pair[1].0 < pair[0].1 {
+            return Err("edits overlap".into());
+        }
+    }
+    let mut out = String::new();
+    let mut cursor = 0;
+    for (start, end, new) in spans {
+        out.push_str(&text[cursor..start]);
+        out.push_str(new);
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    Ok(out)
 }
 
 /// Pull vmlinuz, initrd, and the grub root= line out of the disk.
@@ -708,6 +770,20 @@ mod tests {
         assert_eq!(rewrite_vm("debian@vm:hello", "192.168.64.2"), "debian@192.168.64.2:hello");
         assert_eq!(rewrite_vm("./hello", "192.168.64.2"), "./hello");
         assert_eq!(rewrite_vm("debian@other:x", "192.168.64.2"), "debian@other:x");
+    }
+
+    #[test]
+    fn edits_match_the_original() {
+        let text = "one two three";
+        let got = apply_edits(
+            text,
+            &["one".into(), "three".into()],
+            &["1".into(), "3".into()],
+        )
+        .unwrap();
+        assert_eq!(got, "1 two 3");
+        assert!(apply_edits(text, &["two".into(), "two t".into()], &["a".into(), "b".into()]).is_err());
+        assert!(apply_edits(text, &["t".into()], &["x".into()]).is_err());
     }
 
     #[test]

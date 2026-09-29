@@ -65,6 +65,12 @@ struct Cli {
 
     #[arg(long, default_value_t = 2048)]
     mem_mb: u64,
+
+    /// Working disk size in GiB. The copied image is grown so growroot can
+    /// expand the root filesystem. GNOME does not fit in the 3G cloud image.
+    /// 0 leaves the image size.
+    #[arg(long, default_value_t = 8)]
+    disk_gb: u64,
 }
 
 #[derive(Subcommand)]
@@ -137,7 +143,7 @@ enum Cmd {
         #[arg(long)]
         new: String,
     },
-    /// Open the console window again. The guest keeps running if the window was closed.
+    /// Open the display window again. The guest keeps running if the window was closed.
     Attach {
         #[arg(long)]
         dir: PathBuf,
@@ -201,6 +207,7 @@ fn main() {
             die(&format!("copy failed: {e}"));
         }
     }
+    grow_disk(&disk, cli.disk_gb);
 
     let cloud_init = match (&cli.user_data, &cli.meta_data) {
         (None, None) => None,
@@ -211,7 +218,11 @@ fn main() {
         )),
     };
 
-    let append = if cloud_init.is_some() { "ds=nocloud" } else { "" };
+    let append = if cloud_init.is_some() {
+        "console=hvc0 ds=nocloud"
+    } else {
+        "console=hvc0"
+    };
     let cmdline = split_image(&disk, &dir, append);
     eprintln!("kernel command line: {cmdline}");
 
@@ -590,6 +601,28 @@ fn write_file(path: &Path, bytes: &[u8]) {
     }
 }
 
+/// Grow the working disk. cloud-initramfs-growroot expands the partition on boot.
+fn grow_disk(disk: &Path, gb: u64) {
+    if gb == 0 {
+        return;
+    }
+    let want = gb.saturating_mul(1024 * 1024 * 1024);
+    let len = fs::metadata(disk)
+        .unwrap_or_else(|e| die(&format!("cannot stat {}: {e}", disk.display())))
+        .len();
+    if len >= want {
+        return;
+    }
+    eprintln!("growing {} to {gb}G", disk.display());
+    let f = fs::OpenOptions::new()
+        .write(true)
+        .open(disk)
+        .unwrap_or_else(|e| die(&format!("cannot grow {}: {e}", disk.display())));
+    if let Err(e) = f.set_len(want) {
+        die(&format!("cannot grow {}: {e}", disk.display()));
+    }
+}
+
 fn tmp_dir() -> PathBuf {
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -743,6 +776,21 @@ mod tests {
         assert_eq!(vm_dir_from_ps(line).unwrap(), PathBuf::from("/tmp/vm"));
         assert!(vm_dir_from_ps("  1 /bin/launchd").is_none());
         assert!(vm_dir_from_ps("  9 /tmp/vmcore /tmp/other.img").is_none());
+    }
+
+    #[test]
+    fn grows_a_small_disk() {
+        let dir = std::env::temp_dir().join(format!("vmagent-grow-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let disk = dir.join("disk.img");
+        fs::write(&disk, [0u8; 8]).unwrap();
+        grow_disk(&disk, 0);
+        assert_eq!(fs::metadata(&disk).unwrap().len(), 8);
+        grow_disk(&disk, 1);
+        assert_eq!(fs::metadata(&disk).unwrap().len(), 1024 * 1024 * 1024);
+        grow_disk(&disk, 1);
+        assert_eq!(fs::metadata(&disk).unwrap().len(), 1024 * 1024 * 1024);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

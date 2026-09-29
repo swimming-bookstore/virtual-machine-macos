@@ -27,21 +27,35 @@ bin/vmagent --image images/debian.raw \
   --dir /tmp/vm
 ```
 
-This returns immediately. The guest keeps running after the terminal exits. A window opens with the console. Closing it, or Ctrl+C, leaves the guest running. Console output is `vm.log` in `--dir`.
+Headless. Login is `debian` / `debian`. The command returns immediately. The guest keeps running after the terminal exits. Closing the window, or Ctrl+C, does not stop it.
 
-Without `--dir`, files go under `/tmp/vmagent-<time>`.
+`--dir` holds the disk copy, `vm.log` (host), and `console.log` (guest). Without it, files go under `/tmp/vmagent-<time>`.
 
-The disk is not booted through GRUB. `vmagent` splits `vmlinuz` and `initrd.img` out of `/boot` and `vmcore` starts them with `VZLinuxBootLoader`. The kernel file Debian ships is already an uncompressed ARM64 Image (it also has an EFI stub). `root=` is copied from `grub.cfg`.
+`vmagent` copies the image, splits `vmlinuz` and `initrd.img` out of `/boot`, and `vmcore` starts them with `VZLinuxBootLoader`. `root=` comes from `grub.cfg`. `--user-data` attaches a `cidata` disk and points cloud-init at it. Cloud-init runs once per `instance-id`.
 
-The generic image has no default password. `--user-data` attaches a disk labeled `cidata` and points cloud-init at it from the kernel command line. `user-data` must start with `#cloud-config`. Cloud-init applies it once per `instance-id`. `cloud-init/user-data` creates `debian` / `debian` and starts sshd.
+Wait about a minute on a fresh disk. `guest started` in `vm.log` only means the host process is up.
 
-On a fresh disk, wait about a minute for cloud-init to install sshd.
+## 4. Desktop
 
-## 4. SSH and copy files
+Same image. Pass `cloud-init/user-data-gui` and more RAM. The working disk grows to 8G (`--disk-gb`) so `task-gnome-desktop` fits. Use a new `--dir`. Cloud-init will not retry packages on a disk that already ran.
 
-Each `--dir` gets a stable MAC. `ssh` and `scp` look that MAC up in `arp -an` and replace `vm` with the guest address. `no address` means the guest is not up yet.
+```bash
+bin/vmagent --image images/debian.raw \
+  --user-data cloud-init/user-data-gui \
+  --meta-data cloud-init/meta-data \
+  --dir /tmp/vm-gui \
+  --mem-mb 4096
+```
 
-Password is `debian`.
+First boot is slow. `console.log` can sit on `Reached target Cloud-init target.` for many minutes while apt runs. Then the window shows GDM. Log in as `debian` / `debian`.
+
+![GNOME login](docs/vm-desktop.png)
+
+Close the window and open it again with `bin/vmagent attach --dir /tmp/vm-gui`.
+
+## 5. SSH and copy files
+
+Each `--dir` gets a stable MAC. `ssh` and `scp` look that MAC up in `arp -an` and replace `vm` with the guest address. `no address` means the guest is not up yet. Password is `debian`.
 
 ```bash
 bin/vmagent ssh --dir /tmp/vm debian@vm
@@ -50,7 +64,7 @@ bin/vmagent scp --dir /tmp/vm /tmp/hello debian@vm:/tmp/hello
 bin/vmagent ssh --dir /tmp/vm debian@vm cat /tmp/hello
 ```
 
-## 5. List, reattach, stop
+## 6. List, reattach, stop
 
 ```bash
 bin/vmagent list
@@ -58,11 +72,11 @@ bin/vmagent attach --dir /tmp/vm
 bin/vmagent stop --dir /tmp/vm
 ```
 
-`list` asks `ps` for running `vmcore` processes and prints each disk's directory. There is no registry file, so a VM that is already running is listed, and `/tmp` and `/private/tmp` are not two entries. `attach` opens the window again. `stop` kills the VM.
+`list` reads running `vmcore` processes. `attach` opens the window. `stop` kills the VM.
 
-## 6. Run commands and edit files
+## 7. Run commands and edit files
 
-These use the same ssh session as `debian`. `--sudo` runs as root.
+Same ssh session as `debian`. `--sudo` runs as root.
 
 ```bash
 bin/vmagent run --dir /tmp/vm uname -a

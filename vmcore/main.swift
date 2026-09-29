@@ -1,7 +1,8 @@
 // Boot a Linux guest with a direct kernel.
 // Usage: vmcore <disk.img> <kernel> <initrd> <cmdline> <cpus> <memory-mb> [cidata.raw]
 // VZLinuxBootLoader takes the kernel command line. The disk is still the root filesystem.
-// The window is only a console. Closing it leaves the guest running.
+// The window is the display. Closing it leaves the guest running.
+// Guest text goes to console.log next to the disk (hvc0).
 // vm.pid is written next to the disk. SIGUSR1 shows the window again.
 //
 // VM_MAC is the Ethernet address. sshd listens on port 22.
@@ -62,6 +63,16 @@ gui.scanouts = [VZVirtioGraphicsScanoutConfiguration(widthInPixels: 1280, height
 config.graphicsDevices = [gui]
 config.keyboards = [VZUSBKeyboardConfiguration()]
 config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+
+// The window is the display. This file is the guest's text console.
+let consoleURL = diskURL.deletingLastPathComponent().appendingPathComponent("console.log")
+FileManager.default.createFile(atPath: consoleURL.path, contents: nil)
+let console = VZVirtioConsoleDeviceSerialPortConfiguration()
+console.attachment = VZFileHandleSerialPortAttachment(
+    fileHandleForReading: nil,
+    fileHandleForWriting: try FileHandle(forWritingTo: consoleURL)
+)
+config.serialPorts = [console]
 
 try config.validate()
 

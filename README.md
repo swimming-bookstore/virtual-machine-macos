@@ -27,13 +27,24 @@ bin/vmagent --image images/debian.raw \
   --dir /tmp/vm
 ```
 
+Headless. For a desktop, use the other file and a fresh disk:
+
+```bash
+bin/vmagent --image images/debian.raw \
+  --user-data cloud-init/user-data-gui \
+  --meta-data cloud-init/meta-data \
+  --dir /tmp/vm-gui
+```
+
 This returns immediately. The guest keeps running after the terminal exits. A window opens with the console. Closing it, or Ctrl+C, leaves the guest running. Console output is `vm.log` in `--dir`.
 
 Without `--dir`, files go under `/tmp/vmagent-<time>`.
 
 The disk is not booted through GRUB. `vmagent` splits `vmlinuz` and `initrd.img` out of `/boot` and `vmcore` starts them with `VZLinuxBootLoader`. The kernel file Debian ships is already an uncompressed ARM64 Image (it also has an EFI stub). `root=` is copied from `grub.cfg`.
 
-The generic image has no default password. `--user-data` attaches a disk labeled `cidata` and points cloud-init at it from the kernel command line. `user-data` must start with `#cloud-config`. Cloud-init applies it once per `instance-id`. `cloud-init/user-data` creates `debian` / `debian` and starts sshd.
+The generic image has no default password. `--user-data` attaches a disk labeled `cidata` and points cloud-init at it from the kernel command line. `user-data` must start with `#cloud-config`. Cloud-init applies it once per `instance-id`. `cloud-init/user-data` creates `debian` / `debian` and starts sshd. That boot stays headless.
+
+For a desktop, pass `cloud-init/user-data-gui` instead. It is the same user, plus `task-gnome-desktop`, and it sets the graphical target. The first boot is slow. The window is the display. Use a different `--dir` so cloud-init applies the new `instance-id` on a fresh disk.
 
 On a fresh disk, wait about a minute for cloud-init to install sshd.
 

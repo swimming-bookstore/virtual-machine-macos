@@ -46,7 +46,9 @@ The generic image has no default password. `--user-data` attaches a disk labeled
 
 For a desktop, pass `cloud-init/user-data-gui` instead. It is the same user, plus `task-gnome-desktop`, and it sets the graphical target. The first boot is slow. The window is the display. Use a different `--dir` so cloud-init applies the new `instance-id` on a fresh disk.
 
-On a fresh disk, wait about a minute for cloud-init to install sshd. `console.log` shows the boot. `guest started` in `vm.log` only means the host process is up.
+On a fresh disk, wait about a minute for cloud-init to install sshd. `console.log` shows the boot. With `--user-data`, the kernel command line also has `cloud-init=enabled`, so the same file shows `cloud-init` stage lines (`init-local`, `init`, `modules`, `final`). `guest started` in `vm.log` only means the host process is up.
+
+If the last line stays on `Reached target Cloud-init target.`, cloud-init is still installing packages. Desktop `task-gnome-desktop` can sit there for many minutes with no new line. It is not stuck until that line is unchanged for a long time and `bin/vmagent ssh --dir <dir> debian@vm` still says `no address`.
 
 ## 4. SSH and copy files
 

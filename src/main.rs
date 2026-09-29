@@ -212,7 +212,7 @@ fn main() {
     };
 
     let append = if cloud_init.is_some() {
-        "console=hvc0 ds=nocloud"
+        "console=hvc0 ds=nocloud cloud-init=enabled"
     } else {
         "console=hvc0"
     };

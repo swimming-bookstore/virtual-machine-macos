@@ -10,7 +10,9 @@ users:
 ssh_pwauth: true
 chpasswd:
   expire: false
-package_update: false
+package_update: true
+package_upgrade: false
+package_reboot_if_required: false
 packages:
   - openssh-server
   - task-gnome-desktop

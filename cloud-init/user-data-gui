@@ -19,3 +19,4 @@ packages:
 runcmd:
   - systemctl enable --now ssh
   - systemctl set-default graphical.target
+  - systemctl isolate graphical.target

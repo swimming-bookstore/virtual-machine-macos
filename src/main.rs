@@ -16,6 +16,11 @@
 //!   vmagent read --dir /tmp/vm /etc/os-release --offset 1 --limit 20
 //!   vmagent write --dir /tmp/vm /tmp/hello --file ./hello
 //!   vmagent edit --dir /tmp/vm /tmp/hello --old 'hello' --new 'hello world'
+//!   vmagent screenshot --dir /tmp/vm --out shot.png
+//!   vmagent input --dir /tmp/vm <<'EOF'
+//!   type hello
+//!   key enter
+//!   EOF
 //!   vmagent attach --dir /tmp/vm
 //!   vmagent stop --dir /tmp/vm
 //!   vmagent list
@@ -143,6 +148,24 @@ enum Cmd {
         #[arg(long)]
         new: String,
     },
+    /// Save the guest display as a PNG.
+    Screenshot {
+        #[arg(long)]
+        dir: PathBuf,
+        /// Where to write the PNG. Default: screenshot.png in the current directory.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Send keyboard and pointer events to the guest display.
+    ///
+    /// One command per line on stdin:
+    /// `key <name> [down|up]`, `type <text>`, `move <x> <y>`,
+    /// `button <left|right|middle> [down|up]`, `scroll <n>`.
+    /// The helper stays up until stdin closes, so a `down` stays down.
+    Input {
+        #[arg(long)]
+        dir: PathBuf,
+    },
     /// Open the display window again. The guest keeps running if the window was closed.
     Attach {
         #[arg(long)]
@@ -179,6 +202,8 @@ fn main() {
                 old,
                 new,
             } => edit_cmd(&dir, sudo, &path, &old, &new),
+            Cmd::Screenshot { dir, out } => screenshot_cmd(&dir, out.as_deref()),
+            Cmd::Input { dir } => input_cmd(&dir),
             Cmd::Attach { dir } => signal_vm(&dir, "-USR1"),
             Cmd::Stop { dir } => signal_vm(&dir, "-TERM"),
             Cmd::List => list_cmd(),
@@ -495,6 +520,110 @@ fn edit_cmd(dir: &Path, sudo: bool, path: &str, old: &str, new: &str) -> ! {
         sh_quote(new)
     );
     ssh_run(dir, sudo, &script);
+}
+
+const INPUTD_GUEST: &str = "/usr/local/bin/vmagent-input";
+
+fn find_inputd() -> PathBuf {
+    if let Some(p) = std::env::var_os("INPUTD") {
+        return PathBuf::from(p);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let next_to = dir.join("inputd.py");
+            if next_to.is_file() {
+                return next_to;
+            }
+        }
+    }
+    PathBuf::from("scripts/inputd.py")
+}
+
+/// Copy the input helper once. uinput is root-only, so later calls use sudo.
+fn ensure_inputd(dir: &Path) {
+    let script = find_inputd();
+    if !script.is_file() {
+        die("inputd.py not found");
+    }
+    let mut bytes = Vec::new();
+    File::open(&script)
+        .and_then(|mut f| f.read_to_end(&mut bytes))
+        .unwrap_or_else(|e| die(&format!("cannot read {}: {e}", script.display())));
+    let check = format!("test -x {INPUTD_GUEST}");
+    let status = ssh_status(dir, true, &check);
+    if status == 0 {
+        return;
+    }
+    let install = format!("mkdir -p /usr/local/bin && cat > {INPUTD_GUEST} && chmod 755 {INPUTD_GUEST}");
+    let mut child = Command::new("ssh")
+        .args(ssh_base())
+        .arg(guest_target(dir))
+        .arg(remote_shell(true, &install))
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| die(&format!("cannot run ssh: {e}")));
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap_or_else(|e| die(&format!("cannot send input helper: {e}")));
+    let status = child.wait().unwrap_or_else(|e| die(&format!("ssh failed: {e}")));
+    if !status.success() {
+        die("cannot install input helper");
+    }
+}
+
+fn ssh_status(dir: &Path, sudo: bool, command: &str) -> i32 {
+    Command::new("ssh")
+        .args(ssh_base())
+        .arg(guest_target(dir))
+        .arg(remote_shell(sudo, command))
+        .status()
+        .unwrap_or_else(|e| die(&format!("cannot run ssh: {e}")))
+        .code()
+        .unwrap_or(1)
+}
+
+/// Grab the display with gnome-screenshot and copy the PNG back.
+fn screenshot_cmd(dir: &Path, out: Option<&Path>) -> ! {
+    let dest = out.unwrap_or(Path::new("screenshot.png"));
+    let remote = "/tmp/vmagent-screenshot.png";
+    let status = ssh_status(dir, false, &format!("gnome-screenshot -f {}", sh_quote(remote)));
+    if status != 0 {
+        die("gnome-screenshot failed (is the desktop up?)");
+    }
+    let scp = Command::new("scp")
+        .args(ssh_base())
+        .arg(format!("{}:{remote}", guest_target(dir)))
+        .arg(dest)
+        .status()
+        .unwrap_or_else(|e| die(&format!("cannot run scp: {e}")));
+    if !scp.success() {
+        die("cannot copy screenshot");
+    }
+    eprintln!("{}", dest.display());
+    std::process::exit(0);
+}
+
+/// One uinput process for the whole stdin. A held key stays down until `up` or stdin closes.
+fn input_cmd(dir: &Path) -> ! {
+    ensure_inputd(dir);
+    let mut child = Command::new("ssh")
+        .args(ssh_base())
+        .arg(guest_target(dir))
+        .arg(remote_shell(true, INPUTD_GUEST))
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| die(&format!("cannot run ssh: {e}")));
+    let mut stdin = child.stdin.take().unwrap();
+    let copy = std::io::copy(&mut std::io::stdin(), &mut stdin);
+    drop(stdin);
+    if let Err(e) = copy {
+        die(&format!("cannot send input: {e}"));
+    }
+    let status = child.wait().unwrap_or_else(|e| die(&format!("ssh failed: {e}")));
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// Pull vmlinuz, initrd, and the grub root= line out of the disk.

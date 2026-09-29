@@ -84,3 +84,19 @@ bin/vmagent read --dir /tmp/vm /etc/os-release --offset 1 --limit 20
 bin/vmagent write --dir /tmp/vm /tmp/hello --file ./hello
 bin/vmagent edit --dir /tmp/vm /tmp/hello --old 'hello' --new 'hello world'
 ```
+
+## 8. Computer use
+
+Desktop guests only. The display is 1280x800. `screenshot` saves a PNG. `input` sends keys and pointer events through one guest helper. The first call copies that helper over ssh.
+
+```bash
+bin/vmagent screenshot --dir /tmp/vm-gui --out shot.png
+bin/vmagent input --dir /tmp/vm-gui <<'EOF'
+type hello
+key enter
+move 640 400
+button left
+EOF
+```
+
+The helper stays up until stdin closes, so `key leftctrl down` stays down until `key leftctrl up`. `scroll -3` scrolls down.

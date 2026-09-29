@@ -69,7 +69,7 @@ struct Cli {
     /// Working disk size in GiB. The copied image is grown so growroot can
     /// expand the root filesystem. GNOME does not fit in the 3G cloud image.
     /// 0 leaves the image size.
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 8)]
     disk_gb: u64,
 }
 
@@ -219,7 +219,7 @@ fn main() {
     };
 
     let append = if cloud_init.is_some() {
-        "console=hvc0 ds=nocloud cloud-init=enabled"
+        "console=hvc0 ds=nocloud"
     } else {
         "console=hvc0"
     };

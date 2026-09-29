@@ -36,7 +36,7 @@ bin/vmagent --image images/debian.raw \
   --dir /tmp/vm-gui
 ```
 
-This returns immediately. The guest keeps running after the terminal exits. A window opens with the console. Closing it, or Ctrl+C, leaves the guest running. Console output is `vm.log` in `--dir`.
+This returns immediately. The guest keeps running after the terminal exits. A window opens with the display. Closing it, or Ctrl+C, leaves the guest running. `vm.log` is the host. Guest text is `console.log` in `--dir`.
 
 Without `--dir`, files go under `/tmp/vmagent-<time>`.
 
@@ -46,7 +46,7 @@ The generic image has no default password. `--user-data` attaches a disk labeled
 
 For a desktop, pass `cloud-init/user-data-gui` instead. It is the same user, plus `task-gnome-desktop`, and it sets the graphical target. The first boot is slow. The window is the display. Use a different `--dir` so cloud-init applies the new `instance-id` on a fresh disk.
 
-On a fresh disk, wait about a minute for cloud-init to install sshd.
+On a fresh disk, wait about a minute for cloud-init to install sshd. `console.log` shows the boot. `guest started` in `vm.log` only means the host process is up.
 
 ## 4. SSH and copy files
 

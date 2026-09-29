@@ -137,7 +137,7 @@ enum Cmd {
         #[arg(long)]
         new: String,
     },
-    /// Open the console window again. The guest keeps running if the window was closed.
+    /// Open the display window again. The guest keeps running if the window was closed.
     Attach {
         #[arg(long)]
         dir: PathBuf,
@@ -211,7 +211,11 @@ fn main() {
         )),
     };
 
-    let append = if cloud_init.is_some() { "ds=nocloud" } else { "" };
+    let append = if cloud_init.is_some() {
+        "console=hvc0 ds=nocloud"
+    } else {
+        "console=hvc0"
+    };
     let cmdline = split_image(&disk, &dir, append);
     eprintln!("kernel command line: {cmdline}");
 

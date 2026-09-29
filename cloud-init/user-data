@@ -13,5 +13,7 @@ chpasswd:
 package_update: false
 packages:
   - openssh-server
+  - task-gnome-desktop
 runcmd:
   - systemctl enable --now ssh
+  - systemctl set-default graphical.target

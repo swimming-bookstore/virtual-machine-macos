@@ -15,7 +15,7 @@ package_upgrade: false
 package_reboot_if_required: false
 packages:
   - openssh-server
-  - task-gnome-desktop
+  - task-xfce-desktop
 runcmd:
   - systemctl enable --now ssh
   - systemctl set-default graphical.target

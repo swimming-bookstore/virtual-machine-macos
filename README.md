@@ -37,7 +37,7 @@ Wait about a minute on a fresh disk. `guest started` in `vm.log` only means the 
 
 ## 4. Desktop
 
-Same image. Pass `cloud-init/user-data-gui` and more RAM. The working disk grows to 8G (`--disk-gb`) so `task-gnome-desktop` fits. Use a new `--dir`. Cloud-init will not retry packages on a disk that already ran.
+Same image. Pass `cloud-init/user-data-gui` and more RAM. The working disk grows to 8G (`--disk-gb`) so `task-xfce-desktop` fits. Use a new `--dir`. Cloud-init will not retry packages on a disk that already ran.
 
 ```bash
 bin/vmagent --image images/debian.raw \
@@ -47,9 +47,9 @@ bin/vmagent --image images/debian.raw \
   --mem-mb 4096
 ```
 
-First boot is slow. `console.log` can sit on `Reached target Cloud-init target.` for many minutes while apt runs. Then the window shows GDM. Log in as `debian` / `debian`.
+First boot is slow. `console.log` can sit on `Reached target Cloud-init target.` for many minutes while apt runs. Then the window shows the XFCE login. Log in as `debian` / `debian`.
 
-![GNOME login](docs/vm-desktop.png)
+![XFCE login](docs/vm-desktop.png)
 
 Close the window and open it again with `bin/vmagent attach --dir /tmp/vm-gui`.
 

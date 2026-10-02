@@ -67,7 +67,7 @@ struct Cli {
     mem_mb: u64,
 
     /// Working disk size in GiB. The copied image is grown so growroot can
-    /// expand the root filesystem. GNOME does not fit in the 3G cloud image.
+    /// expand the root filesystem. XFCE does not fit in the 3G cloud image.
     /// 0 leaves the image size.
     #[arg(long, default_value_t = 8)]
     disk_gb: u64,

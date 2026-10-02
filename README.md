@@ -72,9 +72,22 @@ bin/vmagent attach --dir /tmp/vm
 bin/vmagent stop --dir /tmp/vm
 ```
 
-`list` reads running `vmcore` processes. `attach` opens the window. `stop` kills the VM.
+`list` reads running `vmcore` processes. `attach` opens the window. `stop` kills the VM. `list --json` is what the manager GUI uses.
 
-## 7. Run commands and edit files
+## 7. Manager GUI
+
+Rust still does setup. SwiftUI (`gui/`) lists VMs and calls `vmagent`. The guest window is still `vmcore`.
+
+```bash
+scripts/build-gui.sh
+open bin/VMAgent.app
+```
+
+![VMAgent manager](docs/vm-manager.png)
+
+New VMs go in `~/VMs/<name>`. Fetch the Debian image from the VM menu if `images/debian.raw` is missing. Start, attach, stop, and SSH use the same commands as the CLI.
+
+## 8. Run commands and edit files
 
 Same ssh session as `debian`. `--sudo` runs as root.
 

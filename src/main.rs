@@ -19,6 +19,7 @@
 //!   vmagent attach --dir /tmp/vm
 //!   vmagent stop --dir /tmp/vm
 //!   vmagent list
+//!   vmagent list --json
 //!
 //! The guest is started in its own session. Closing the window or the terminal
 //! leaves it running. `attach` opens the window again. `stop` kills it.
@@ -154,7 +155,11 @@ enum Cmd {
         dir: PathBuf,
     },
     /// Print directories of VMs that are still running.
-    List,
+    List {
+        /// `[{"dir":"...","pid":1}]` instead of one directory per line.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() {
@@ -181,7 +186,7 @@ fn main() {
             } => edit_cmd(&dir, sudo, &path, &old, &new),
             Cmd::Attach { dir } => signal_vm(&dir, "-USR1"),
             Cmd::Stop { dir } => signal_vm(&dir, "-TERM"),
-            Cmd::List => list_cmd(),
+            Cmd::List { json } => list_cmd(json),
         }
     }
 
@@ -651,7 +656,43 @@ fn pid_file(dir: &Path) -> PathBuf {
     dir.join("vm.pid")
 }
 
-fn list_cmd() -> ! {
+fn list_cmd(json: bool) -> ! {
+    let vms = running_vms();
+    if json {
+        print!("[");
+        for (i, (pid, dir)) in vms.iter().enumerate() {
+            if i > 0 {
+                print!(",");
+            }
+            print!(
+                "{{\"dir\":\"{}\",\"pid\":{pid}}}",
+                json_escape(&dir.display().to_string())
+            );
+        }
+        println!("]");
+    } else {
+        for (_, dir) in &vms {
+            println!("{}", dir.display());
+        }
+    }
+    std::process::exit(0);
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn running_vms() -> Vec<(u32, PathBuf)> {
     let out = Command::new("ps")
         .args(["-axww", "-o", "pid=,command="])
         .output()
@@ -661,23 +702,24 @@ fn list_cmd() -> ! {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut seen = std::collections::BTreeSet::new();
+    let mut vms = Vec::new();
     for line in text.lines() {
-        let Some(dir) = vm_dir_from_ps(line) else {
+        let Some((pid, dir)) = vm_from_ps(line) else {
             continue;
         };
         // One process, one line. Canonicalize only to drop a second spelling.
         let key = fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
         if seen.insert(key) {
-            println!("{}", dir.display());
+            vms.push((pid, dir));
         }
     }
-    std::process::exit(0);
+    vms
 }
 
 /// `ps` line: pid, vmcore path, disk.img, then the rest of the boot args.
-fn vm_dir_from_ps(line: &str) -> Option<PathBuf> {
+fn vm_from_ps(line: &str) -> Option<(u32, PathBuf)> {
     let mut parts = line.split_whitespace();
-    let _pid = parts.next()?;
+    let pid = parts.next()?.parse().ok()?;
     let bin = parts.next()?;
     if Path::new(bin).file_name()?.to_str()? != "vmcore" {
         return None;
@@ -686,7 +728,7 @@ fn vm_dir_from_ps(line: &str) -> Option<PathBuf> {
     if !disk.ends_with("disk.img") {
         return None;
     }
-    Path::new(disk).parent().map(|p| p.to_path_buf())
+    Some((pid, Path::new(disk).parent()?.to_path_buf()))
 }
 
 fn vm_pid(dir: &Path) -> u32 {
@@ -773,9 +815,15 @@ mod tests {
     #[test]
     fn reads_vm_dir_from_ps() {
         let line = "  2585 /usr/local/bin/vmcore /tmp/vm/disk.img /tmp/vm/vmlinuz /tmp/vm/initrd root=LABEL=root 2 2048";
-        assert_eq!(vm_dir_from_ps(line).unwrap(), PathBuf::from("/tmp/vm"));
-        assert!(vm_dir_from_ps("  1 /bin/launchd").is_none());
-        assert!(vm_dir_from_ps("  9 /tmp/vmcore /tmp/other.img").is_none());
+        assert_eq!(vm_from_ps(line).unwrap(), (2585, PathBuf::from("/tmp/vm")));
+        assert!(vm_from_ps("  1 /bin/launchd").is_none());
+        assert!(vm_from_ps("  9 /tmp/vmcore /tmp/other.img").is_none());
+    }
+
+    #[test]
+    fn json_escapes_paths() {
+        assert_eq!(json_escape("/tmp/vm"), "/tmp/vm");
+        assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
     }
 
     #[test]

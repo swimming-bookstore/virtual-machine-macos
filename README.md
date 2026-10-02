@@ -83,6 +83,8 @@ scripts/build-gui.sh
 open bin/VMAgent.app
 ```
 
+![VMAgent manager](docs/vm-manager.png)
+
 New VMs go in `~/VMs/<name>`. Fetch the Debian image from the VM menu if `images/debian.raw` is missing. Start, attach, stop, and SSH use the same commands as the CLI.
 
 ## 8. Run commands and edit files

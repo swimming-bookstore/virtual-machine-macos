@@ -14,10 +14,95 @@ package_update: true
 package_upgrade: false
 package_reboot_if_required: false
 packages:
+  # xfce4, not task-xfce-desktop: that task pulls LibreOffice and the rest of a
+  # full Debian desktop. lightdm + xserver-xorg are the display.
   - openssh-server
-  - task-gnome-desktop
-  - gnome-screenshot
+  - xfce4
+  - firefox-esr
+  - xrdp
+  - x11vnc
+  - xserver-xorg
+  - lightdm
+  - imagemagick
+  - xdotool
+  # Guest ffmpeg / libavcodec-extra are for Firefox YouTube decode, not demos.
+  - ffmpeg
+  - libavcodec-extra
+write_files:
+  - path: /etc/lightdm/lightdm.conf.d/vmagent.conf
+    content: |
+      [Seat:*]
+      autologin-user=debian
+      autologin-user-timeout=0
+      user-session=xfce
+  - path: /home/debian/.xsession
+    owner: debian:debian
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      exec startxfce4
+  - path: /etc/systemd/system/x11vnc.service
+    content: |
+      [Unit]
+      Description=Share the virtio display with xrdp
+      After=display-manager.service
+      [Service]
+      ExecStartPre=/bin/sh -c 'until [ -S /tmp/.X11-unix/X0 ]; do sleep 1; done'
+      ExecStart=/usr/bin/x11vnc -display :0 -auth /var/run/lightdm/root/:0 -localhost -forever -shared -repeat -ncache 0 -rfbauth /etc/xrdp/vnc.pass
+      Restart=on-failure
+      RestartSec=2
+      [Install]
+      WantedBy=graphical.target
+  - path: /usr/lib/firefox-esr/distribution/policies.json
+    defer: true
+    content: |
+      {
+        "policies": {
+          "Preferences": {
+            "media.hardware-video-decoding.enabled": { "Value": false, "Status": "user" },
+            "media.ffmpeg.vaapi.enabled": { "Value": false, "Status": "user" },
+            "media.av1.enabled": { "Value": false, "Status": "user" },
+            "gfx.webrender.force-disabled": { "Value": true, "Status": "user" },
+            "layers.acceleration.disabled": { "Value": true, "Status": "user" },
+            "media.autoplay.default": { "Value": 0, "Status": "user" }
+          }
+        }
+      }
 runcmd:
-  - systemctl enable --now ssh
-  - systemctl set-default graphical.target
-  - systemctl isolate graphical.target
+  # One XFCE on :0. x11vnc shares it; xrdp's libvnc.so connects, so RDP is the same session.
+  - |
+    set -e
+    systemctl unmask lightdm || true
+    mkdir -p /etc/xrdp
+    x11vnc -storepasswd debian /etc/xrdp/vnc.pass
+    chmod 644 /etc/xrdp/vnc.pass
+    python3 - <<'PY'
+    from pathlib import Path
+    p = Path("/etc/xrdp/xrdp.ini")
+    lines = p.read_text().splitlines(True)
+    out, i, replaced = [], 0, False
+    while i < len(lines):
+        if lines[i].strip() == "[Xorg]" and not replaced:
+            out.extend(
+                "[Xorg]\nname=Xorg\nlib=libvnc.so\nusername=debian\n"
+                "password=debian\nip=127.0.0.1\nport=5900\n"
+            )
+            i += 1
+            while i < len(lines) and not lines[i].startswith("["):
+                i += 1
+            replaced = True
+            continue
+        if lines[i].strip() == "autorun=":
+            out.append("autorun=Xorg\n")
+            i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    if not replaced:
+        raise SystemExit("xrdp.ini [Xorg] block missing")
+    p.write_text("".join(out))
+    PY
+    usermod -aG video,render debian || true
+    systemctl daemon-reload
+    systemctl enable --now ssh lightdm x11vnc xrdp xrdp-sesman
+    systemctl restart lightdm x11vnc xrdp || true

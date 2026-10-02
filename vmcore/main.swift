@@ -4,6 +4,7 @@
 // The window is the display. Closing it leaves the guest running.
 // Guest text goes to console.log next to the disk (hvc0).
 // vm.pid is written next to the disk. SIGUSR1 shows the window again.
+// Attach always puts the display view back.
 //
 // VM_MAC is the Ethernet address. sshd listens on port 22.
 // The host wrapper finds the guest by that MAC in the ARP cache.
@@ -58,8 +59,10 @@ boot.initialRamdiskURL = initrdURL
 boot.commandLine = cmdline
 config.bootLoader = boot
 
+let displayWidth = 1280
+let displayHeight = 800
 let gui = VZVirtioGraphicsDeviceConfiguration()
-gui.scanouts = [VZVirtioGraphicsScanoutConfiguration(widthInPixels: 1280, heightInPixels: 800)]
+gui.scanouts = [VZVirtioGraphicsScanoutConfiguration(widthInPixels: displayWidth, heightInPixels: displayHeight)]
 config.graphicsDevices = [gui]
 config.keyboards = [VZUSBKeyboardConfiguration()]
 config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
@@ -93,18 +96,20 @@ func removePid() {
 
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: NSWindow!
+    var displayView: VZVirtualMachineView!
     func applicationDidFinishLaunching(_ note: Notification) {
         writePid()
-        let view = VZVirtualMachineView(frame: NSRect(x: 0, y: 0, width: 1280, height: 800))
-        view.virtualMachine = vm
+        displayView = VZVirtualMachineView(frame: NSRect(x: 0, y: 0, width: displayWidth, height: displayHeight))
+        displayView.virtualMachine = vm
+        displayView.autoresizingMask = [.width, .height]
         window = NSWindow(
-            contentRect: view.frame,
+            contentRect: displayView.frame,
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "debian"
-        window.contentView = view
+        window.contentView = displayView
         window.delegate = self
         window.makeKeyAndOrderFront(nil)
         vm.start { result in
@@ -114,12 +119,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 exit(1)
             }
             fputs("guest started\n", stderr)
+            // Do not reconfigure here. A reconfigure before the guest has
+            // programmed the scanout clears the current mode, and the window
+            // stays black. The scanout is already displayWidth x displayHeight.
         }
     }
     func showWindow() {
+        window.contentView = displayView
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        fputs("window shown\n", stderr)
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         sender.orderOut(nil)

@@ -74,6 +74,8 @@ bin/vmagent firefox --dir /tmp/vm-gui close
 
 `open` with one URL is one tab. Extra URLs are extra tabs. `tabs` marks the active tab with `*`. `close` with no id closes every tab except that one. `close <id>` closes that tab.
 
+[Firefox demo](docs/firefox-tzuyang.mp4)
+
 ## 6. SSH and copy files
 
 Each `--dir` gets a stable MAC. `ssh` and `scp` look that MAC up in `arp -an` and replace `vm` with the guest address. `no address` means the guest is not up yet. Password is `debian`.

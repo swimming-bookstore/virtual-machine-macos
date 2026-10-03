@@ -16,6 +16,9 @@
 //!   vmagent read --dir /tmp/vm /etc/os-release --offset 1 --limit 20
 //!   vmagent write --dir /tmp/vm /tmp/hello --file ./hello
 //!   vmagent edit --dir /tmp/vm /tmp/hello --old 'hello' --new 'hello world'
+//!   vmagent firefox --dir /tmp/vm-gui open https://www.youtube.com/
+//!   vmagent firefox --dir /tmp/vm-gui open --xpi ./uBlock0.firefox.xpi https://www.youtube.com/
+//!   vmagent firefox --dir /tmp/vm-gui tabs
 //!   vmagent attach --dir /tmp/vm
 //!   vmagent stop --dir /tmp/vm
 //!   vmagent list
@@ -160,6 +163,61 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Start Firefox on the guest desktop and drive it over WebDriver BiDi.
+    ///
+    /// A clean profile, `--remote-debugging-port`, then commands on
+    /// `ws://127.0.0.1:<port>/session`. The port stays on the guest.
+    /// Nothing is typed into the window.
+    ///
+    /// `open` kills any Firefox this command started, wipes the profile, and
+    /// starts one window. Extra URLs are extra tabs. `.xpi` files, or `--xpi`,
+    /// are sideloaded into that profile. `tabs`, `goto`, `eval`, `click`,
+    /// `type`, `key`, `screenshot`, and `close` talk to the Firefox that is
+    /// already listening.
+    Firefox {
+        #[arg(long)]
+        dir: PathBuf,
+        /// Guest BiDi port. Default: 9333.
+        #[arg(long, default_value_t = 9333)]
+        port: u16,
+        #[command(subcommand)]
+        action: FirefoxAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum FirefoxAction {
+    /// Close the previous window, start a clean one, open these URLs.
+    Open {
+        /// Sideload this extension. Repeatable. A trailing `.xpi` is the same.
+        #[arg(long)]
+        xpi: Vec<PathBuf>,
+        /// Pages to open, and optional `.xpi` files to sideload.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Print id, url, and title of each tab. The active tab is marked.
+    Tabs,
+    /// Load a URL in the active tab.
+    Goto { url: String },
+    /// Run JavaScript in the active tab and print the result.
+    Eval { expression: String },
+    /// Click in the active tab, in CSS pixels from the viewport origin.
+    Click {
+        x: String,
+        y: String,
+        /// 0 left, 1 middle, 2 right.
+        #[arg(long, default_value_t = 0)]
+        button: i32,
+    },
+    /// Type into the active tab.
+    Type { text: String },
+    /// Press a key in the active tab. A letter, or a name such as `enter`.
+    Key { name: String },
+    /// JPEG of the active tab, as base64.
+    Screenshot,
+    /// Close a tab by id. With no id, close every tab except the active one.
+    Close { id: Option<String> },
 }
 
 fn main() {
@@ -187,6 +245,7 @@ fn main() {
             Cmd::Attach { dir } => signal_vm(&dir, "-USR1"),
             Cmd::Stop { dir } => signal_vm(&dir, "-TERM"),
             Cmd::List { json } => list_cmd(json),
+            Cmd::Firefox { dir, port, action } => firefox_cmd(&dir, port, action),
         }
     }
 
@@ -368,7 +427,29 @@ fn ssh_base() -> Vec<String> {
         "UserKnownHostsFile=/dev/null".into(),
         "-o".into(),
         "LogLevel=ERROR".into(),
+        "-o".into(),
+        "PreferredAuthentications=password".into(),
+        "-o".into(),
+        "PubkeyAuthentication=no".into(),
     ]
+}
+
+fn find_askpass() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let next_to = dir.join("askpass.sh");
+            if next_to.is_file() {
+                return next_to;
+            }
+        }
+    }
+    PathBuf::from("bin/askpass.sh")
+}
+
+fn apply_ssh_env(cmd: &mut Command) {
+    cmd.env("SSH_ASKPASS", find_askpass());
+    cmd.env("SSH_ASKPASS_REQUIRE", "force");
+    cmd.env("DISPLAY", ":0");
 }
 
 /// Replace the dummy host `vm` with the guest address. `user@vm` or `user@vm:path`.
@@ -398,7 +479,9 @@ fn scp_cmd(dir: &Path, args: &[String]) -> ! {
 fn run_ssh_tool(tool: &str, dir: &Path, args: &[String]) -> ! {
     let ip = guest_ip(&mac_for_dir(dir));
     let args: Vec<String> = args.iter().map(|a| rewrite_vm(a, &ip)).collect();
-    let status = Command::new(tool)
+    let mut cmd = Command::new(tool);
+    apply_ssh_env(&mut cmd);
+    let status = cmd
         .args(ssh_base())
         .args(&args)
         .status()
@@ -433,7 +516,9 @@ fn run_cmd(dir: &Path, sudo: bool, command: &[String]) -> ! {
 }
 
 fn ssh_run(dir: &Path, sudo: bool, command: &str) -> ! {
-    let status = Command::new("ssh")
+    let mut cmd = Command::new("ssh");
+    apply_ssh_env(&mut cmd);
+    let status = cmd
         .args(ssh_base())
         .arg(guest_target(dir))
         .arg(remote_shell(sudo, command))
@@ -470,7 +555,9 @@ fn write_cmd(dir: &Path, sudo: bool, path: &str, file: Option<&Path>) -> ! {
         Some(p) => format!("mkdir -p {} && cat > {}", sh_quote(p), sh_quote(path)),
         None => format!("cat > {}", sh_quote(path)),
     };
-    let mut child = Command::new("ssh")
+    let mut cmd = Command::new("ssh");
+    apply_ssh_env(&mut cmd);
+    let mut child = cmd
         .args(ssh_base())
         .arg(guest_target(dir))
         .arg(remote_shell(sudo, &script))
@@ -500,6 +587,357 @@ fn edit_cmd(dir: &Path, sudo: bool, path: &str, old: &str, new: &str) -> ! {
         sh_quote(new)
     );
     ssh_run(dir, sudo, &script);
+}
+
+fn ssh_status(dir: &Path, sudo: bool, command: &str) -> i32 {
+    let mut cmd = Command::new("ssh");
+    apply_ssh_env(&mut cmd);
+    cmd.args(ssh_base())
+        .arg(guest_target(dir))
+        .arg(remote_shell(sudo, command))
+        .status()
+        .unwrap_or_else(|e| die(&format!("cannot run ssh: {e}")))
+        .code()
+        .unwrap_or(1)
+}
+
+fn guest_output(dir: &Path, sudo: bool, command: &str) -> Option<String> {
+    let mut cmd = Command::new("ssh");
+    apply_ssh_env(&mut cmd);
+    let out = cmd
+        .args(ssh_base())
+        .arg(guest_target(dir))
+        .arg(remote_shell(sudo, command))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn send_guest_file(dir: &Path, remote: &str, bytes: &[u8]) {
+    let mut cmd = Command::new("ssh");
+    apply_ssh_env(&mut cmd);
+    let mut child = cmd
+        .args(ssh_base())
+        .arg(guest_target(dir))
+        .arg(remote_shell(false, &format!("cat > {}", sh_quote(remote))))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| die(&format!("cannot run ssh: {e}")));
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(bytes)
+        .unwrap_or_else(|e| die(&format!("cannot send {}: {e}", remote)));
+    let status = child
+        .wait()
+        .unwrap_or_else(|e| die(&format!("ssh failed: {e}")));
+    if !status.success() {
+        die(&format!("cannot copy {remote}"));
+    }
+}
+
+/// Display and `XAUTHORITY` from the Xorg that paints the virtio scanout.
+fn x_session(ps: &str) -> Option<(String, String)> {
+    parse_xorg_line(ps, |line| line.contains("Xorg") && !line.contains("xrdp"))
+        .or_else(|| parse_xorg_line(ps, |line| line.contains("Xorg")))
+}
+
+fn parse_xorg_line(ps: &str, want: impl Fn(&str) -> bool) -> Option<(String, String)> {
+    for line in ps.lines() {
+        if !want(line) {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let display = parts.iter().copied().find(|part| {
+            part.strip_prefix(':')
+                .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+        });
+        let Some(display) = display else {
+            continue;
+        };
+        let Some(auth) = parts
+            .windows(2)
+            .find(|pair| pair[0] == "-auth")
+            .map(|pair| pair[1])
+        else {
+            continue;
+        };
+        let auth = if auth.starts_with('/') {
+            auth.to_string()
+        } else {
+            format!("/home/debian/{auth}")
+        };
+        let auth = if display == ":0" && auth.contains("lightdm") {
+            "/home/debian/.Xauthority".to_string()
+        } else {
+            auth
+        };
+        return Some((display.to_string(), auth));
+    }
+    None
+}
+
+fn x_session_of(dir: &Path) -> Option<(String, String)> {
+    let text = guest_output(dir, true, "ps -ef")?;
+    x_session(&text)
+}
+
+const FIREFOX_PROFILE: &str = "/home/debian/.cache/vmagent/firefox";
+
+/// Prefs for a clean guest profile.
+///
+/// Remote debugging has to be on and the welcome page has to stay off.
+fn firefox_user_js() -> String {
+    let prefs = [
+        ("devtools.debugger.remote-enabled", "true"),
+        ("devtools.debugger.prompt-connection", "false"),
+        ("marionette.enabled", "true"),
+        ("extensions.autoDisableScopes", "0"),
+        ("extensions.enabledScopes", "15"),
+        ("extensions.sideloadScopes", "15"),
+        ("extensions.installDistroAddons", "true"),
+        ("xpinstall.signatures.required", "false"),
+        ("browser.startup.homepage", "\"about:blank\""),
+        ("browser.startup.page", "0"),
+        ("browser.sessionstore.enabled", "false"),
+        ("browser.sessionstore.resume_from_crash", "false"),
+        ("browser.sessionstore.max_resumed_crashes", "0"),
+        ("browser.aboutwelcome.enabled", "false"),
+        ("startup.homepage_welcome_url", "\"\""),
+        ("startup.homepage_welcome_url.additional", "\"\""),
+        ("browser.shell.checkDefaultBrowser", "false"),
+        ("browser.tabs.warnOnClose", "false"),
+        ("places.history.enabled", "false"),
+        ("browser.urlbar.suggest.history", "false"),
+        ("signon.rememberSignons", "false"),
+        ("dom.disable_open_during_load", "true"),
+        ("media.hardware-video-decoding.enabled", "false"),
+        ("media.ffmpeg.vaapi.enabled", "false"),
+        ("media.ffmpeg.enabled", "true"),
+        ("media.ffvpx.enabled", "true"),
+        ("media.av1.enabled", "false"),
+        ("media.autoplay.default", "0"),
+        ("gfx.webrender.all", "false"),
+        ("gfx.webrender.force-disabled", "true"),
+        ("layers.acceleration.disabled", "true"),
+    ];
+    let mut js = String::from("// vmagent firefox profile\n");
+    for (name, value) in prefs {
+        js.push_str(&format!("user_pref(\"{name}\", {value});\n"));
+    }
+    js
+}
+
+fn is_xpi_path(s: &str) -> bool {
+    Path::new(s)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("xpi"))
+}
+
+/// URLs to open, and host paths of extensions to sideload.
+fn split_open_args(args: &[String], extra_xpi: &[PathBuf]) -> (Vec<String>, Vec<PathBuf>) {
+    let mut urls = Vec::new();
+    let mut xpis = extra_xpi.to_vec();
+    for a in args {
+        if is_xpi_path(a) {
+            xpis.push(PathBuf::from(a));
+        } else {
+            urls.push(a.clone());
+        }
+    }
+    (urls, xpis)
+}
+
+/// Gecko add-on id from `manifest.json` inside the xpi.
+fn firefox_addon_id(path: &Path) -> String {
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import json,sys,zipfile\n\
+             z=zipfile.ZipFile(sys.argv[1])\n\
+             m=json.loads(z.read('manifest.json'))\n\
+             g=(m.get('browser_specific_settings') or m.get('applications') or {}).get('gecko') or {}\n\
+             print(g.get('id') or '')",
+        )
+        .arg(path)
+        .output()
+        .unwrap_or_else(|e| die(&format!("cannot read {}: {e}", path.display())));
+    if !out.status.success() {
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        die(&format!("cannot read addon id from {}", path.display()));
+    }
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if id.is_empty() {
+        die(&format!(
+            "{} has no gecko id in manifest.json",
+            path.display()
+        ));
+    }
+    id
+}
+
+/// Shell that stops the Firefox this command started and launches a clean one.
+///
+/// Visible on the virtio display, not `--headless`. The desktop is the viewer.
+/// `xpis` are guest path + add-on id pairs, already copied.
+fn firefox_launch_script(
+    display: &str,
+    auth: &str,
+    port: u16,
+    urls: &[String],
+    xpis: &[(String, String)],
+) -> String {
+    let urls = if urls.is_empty() {
+        "about:blank".to_string()
+    } else {
+        urls.iter().map(|u| sh_quote(u)).collect::<Vec<_>>().join(" ")
+    };
+    let mut copies = String::new();
+    for (remote, id) in xpis {
+        copies.push_str(&format!(
+            "cp {} \"$profile/extensions/\"{}.xpi\n",
+            sh_quote(remote),
+            sh_quote(id),
+        ));
+    }
+    format!(
+        "set -e\n\
+         profile={profile}\n\
+         if [ -f \"$profile/vmagent.pid\" ]; then kill \"$(cat \"$profile/vmagent.pid\")\" 2>/dev/null || true; fi\n\
+         pkill -u debian -f 'remote-debugging-port={port}' 2>/dev/null || true\n\
+         pkill -u debian -f '[p]ython3 /tmp/vmagent-firefox-bidi.py' 2>/dev/null || true\n\
+         rm -f /tmp/vmagent-firefox.log /tmp/vmagent-bidi.log\n\
+         sleep 0.4\n\
+         rm -rf \"$profile\"\n\
+         mkdir -p \"$profile/extensions\"\n\
+         cat > \"$profile/user.js\" <<'EOF'\n\
+         {prefs}\
+         EOF\n\
+         {copies}\
+         chown -R debian:debian \"$(dirname \"$profile\")\"\n\
+         runuser -u debian -- env DISPLAY={display} XAUTHORITY={auth} MOZ_WEBRENDER=0 MOZ_ACCELERATED=0 LIBGL_ALWAYS_SOFTWARE=1 \
+           firefox-esr --no-remote --profile \"$profile\" --remote-debugging-port={port} --width 1280 --height 720 {urls} \
+           >\"$profile/firefox.log\" 2>&1 &\n\
+         echo $! > \"$profile/vmagent.pid\"\n\
+         chown debian:debian \"$profile/vmagent.pid\"\n\
+         i=0\n\
+         while [ \"$i\" -lt 30 ]; do\n\
+           if curl -sf http://127.0.0.1:{port}/ | grep -q httpd.js; then break; fi\n\
+           i=$((i + 1))\n\
+           sleep 0.4\n\
+         done\n\
+         if ! curl -sf http://127.0.0.1:{port}/ | grep -q httpd.js; then\n\
+           echo 'firefox did not open the debug port' >&2\n\
+           tail -n 40 \"$profile/firefox.log\" >&2 || true\n\
+           exit 1\n\
+         fi\n\
+         pkill -u debian -f '[p]ython3 /tmp/vmagent-firefox-bidi.py' 2>/dev/null || true\n\
+         rm -f /tmp/vmagent-bidi.log\n\
+         runuser -u debian -- env BIDI_PORT={port} BIDI_CMD_PORT={cmdport} \
+           nohup python3 /tmp/vmagent-firefox-bidi.py >/tmp/vmagent-bidi.log 2>&1 &\n\
+         i=0\n\
+         while [ \"$i\" -lt 80 ]; do\n\
+           if grep -q bidi.ready /tmp/vmagent-bidi.log 2>/dev/null; then exit 0; fi\n\
+           i=$((i + 1))\n\
+           sleep 0.25\n\
+         done\n\
+         echo 'bidi helper did not start' >&2\n\
+         cat /tmp/vmagent-bidi.log >&2 || true\n\
+         exit 1\n",
+        profile = sh_quote(FIREFOX_PROFILE),
+        prefs = firefox_user_js(),
+        copies = copies,
+        display = sh_quote(display),
+        auth = sh_quote(auth),
+        port = port,
+        cmdport = port.saturating_add(1),
+        urls = urls,
+    )
+}
+
+fn firefox_cmd(dir: &Path, port: u16, action: FirefoxAction) -> ! {
+    match action {
+        FirefoxAction::Open { xpi, args } => {
+            let (urls, xpis) = split_open_args(&args, &xpi);
+            for url in &urls {
+                if !(url.starts_with("http://")
+                    || url.starts_with("https://")
+                    || url.starts_with("about:"))
+                {
+                    die("firefox open takes http, https, or about: URLs, or .xpi files");
+                }
+            }
+            let Some((display, auth)) = x_session_of(dir) else {
+                die("no desktop session yet");
+            };
+            install_firefox_bidi(dir);
+            let mut guest_xpis = Vec::new();
+            for (i, path) in xpis.iter().enumerate() {
+                if !path.is_file() {
+                    die(&format!("xpi not found: {}", path.display()));
+                }
+                let id = firefox_addon_id(path);
+                let remote = format!("/tmp/vmagent-ext-{i}.xpi");
+                let bytes = fs::read(path)
+                    .unwrap_or_else(|e| die(&format!("cannot read {}: {e}", path.display())));
+                send_guest_file(dir, &remote, &bytes);
+                guest_xpis.push((remote, id));
+            }
+            let status = ssh_status(
+                dir,
+                true,
+                &firefox_launch_script(&display, &auth, port, &urls, &guest_xpis),
+            );
+            if status != 0 {
+                die("firefox did not start");
+            }
+            eprintln!("firefox: 127.0.0.1:{port} in the guest");
+            std::process::exit(0);
+        }
+        FirefoxAction::Tabs => firefox_bidi(dir, port, "tabs", ""),
+        FirefoxAction::Goto { url } => firefox_bidi(dir, port, "goto", &url),
+        FirefoxAction::Eval { expression } => firefox_bidi(dir, port, "eval", &expression),
+        FirefoxAction::Click { x, y, button } => {
+            firefox_bidi(dir, port, "click", &format!("{x} {y} {button}"))
+        }
+        FirefoxAction::Type { text } => firefox_bidi(dir, port, "type", &text),
+        FirefoxAction::Key { name } => firefox_bidi(dir, port, "key", &name),
+        FirefoxAction::Screenshot => firefox_bidi(dir, port, "screenshot", ""),
+        FirefoxAction::Close { id } => {
+            firefox_bidi(dir, port, "close", id.as_deref().unwrap_or(""))
+        }
+    }
+}
+
+/// Copy the BiDi helper onto the guest. The debug port is not published by NAT.
+fn install_firefox_bidi(dir: &Path) {
+    send_guest_file(
+        dir,
+        "/tmp/vmagent-firefox-bidi.py",
+        include_bytes!("firefox_bidi.py"),
+    );
+}
+
+/// Talk to the helper that already owns the BiDi socket.
+///
+/// Firefox keeps one session. A second socket cannot join, so commands go
+/// over localhost TCP to that helper.
+fn firefox_bidi(dir: &Path, port: u16, action: &str, arg: &str) -> ! {
+    install_firefox_bidi(dir);
+    let cmd_port = port.saturating_add(1);
+    let command = format!(
+        "BIDI_PORT={port} BIDI_CMD_PORT={cmd_port} BIDI_ACTION={action} BIDI_ARG={arg} python3 /tmp/vmagent-firefox-bidi.py",
+        action = sh_quote(action),
+        arg = sh_quote(arg),
+    );
+    ssh_run(dir, false, &command);
 }
 
 /// Pull vmlinuz, initrd, and the grub root= line out of the disk.
@@ -824,6 +1262,58 @@ mod tests {
     fn json_escapes_paths() {
         assert_eq!(json_escape("/tmp/vm"), "/tmp/vm");
         assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
+    }
+
+    #[test]
+    fn x_display_from_ps() {
+        let lightdm = "root 700 1 0 ? 00:00:01 /usr/lib/xorg/Xorg :0 -seat seat0 -auth /var/run/lightdm/root/:0 -nolisten tcp vt7 -novtswitch\n";
+        assert_eq!(
+            x_session(lightdm),
+            Some((":0".into(), "/home/debian/.Xauthority".into()))
+        );
+        let abs = "debian 1 1 ? /usr/lib/xorg/Xorg :11 -auth /home/debian/.Xauthority\n";
+        assert_eq!(
+            x_session(abs),
+            Some((":11".into(), "/home/debian/.Xauthority".into()))
+        );
+        assert!(x_session("root 1 1 ? /usr/sbin/sshd").is_none());
+        assert!(x_session("").is_none());
+    }
+
+    #[test]
+    fn firefox_open_splits_xpi_and_urls() {
+        let (urls, xpis) = split_open_args(
+            &[
+                "uBlock0.firefox.xpi".into(),
+                "https://www.youtube.com/".into(),
+                "about:blank".into(),
+            ],
+            &[PathBuf::from("extra.xpi")],
+        );
+        assert_eq!(urls, ["https://www.youtube.com/", "about:blank"]);
+        assert_eq!(
+            xpis,
+            [PathBuf::from("extra.xpi"), PathBuf::from("uBlock0.firefox.xpi")]
+        );
+        assert!(is_xpi_path("./addons/foo.XPI"));
+        assert!(is_xpi_path("https://example.com/page.xpi"));
+        assert!(!is_xpi_path("https://example.com/page.html"));
+    }
+
+    #[test]
+    fn firefox_launch_sideloads_xpi() {
+        let launch = firefox_launch_script(
+            ":0",
+            "/home/debian/.Xauthority",
+            9333,
+            &["https://www.youtube.com/".into()],
+            &[("/tmp/vmagent-ext-0.xpi".into(), "uBlock0@raymondhill.net".into())],
+        );
+        assert!(launch.contains("/tmp/vmagent-ext-0.xpi"));
+        assert!(launch.contains("uBlock0@raymondhill.net"));
+        assert!(launch.contains("--remote-debugging-port=9333"));
+        assert!(launch.contains("https://www.youtube.com/"));
+        assert!(launch.contains("firefox-esr"));
     }
 
     #[test]

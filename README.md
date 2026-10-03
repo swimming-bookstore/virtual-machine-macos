@@ -37,7 +37,7 @@ Wait about a minute on a fresh disk. `guest started` in `vm.log` only means the 
 
 ## 4. Desktop
 
-Same image. Pass `cloud-init/user-data-gui` and more RAM. The working disk grows to 8G (`--disk-gb`) so `task-xfce-desktop` fits. Use a new `--dir`. Cloud-init will not retry packages on a disk that already ran.
+Same image. Pass `cloud-init/user-data-gui` and more RAM. The working disk grows to 8G (`--disk-gb`) so `task-xfce-desktop` and Noto CJK fonts fit. Use a new `--dir`. Cloud-init will not retry packages on a disk that already ran.
 
 ```bash
 bin/vmagent --image images/debian.raw \
@@ -53,7 +53,29 @@ First boot is slow. `console.log` can sit on `Reached target Cloud-init target.`
 
 Close the window and open it again with `bin/vmagent attach --dir /tmp/vm-gui`.
 
-## 5. SSH and copy files
+## 5. Firefox
+
+Firefox is a process on the guest, driven over WebDriver BiDi, not by clicking the window. `open` kills the previous window, wipes `~/.cache/vmagent/firefox`, and starts `firefox-esr` on the desktop with `--remote-debugging-port`. Default port is 9333. The port stays inside the guest.
+
+Pass `.xpi` files to `open` to sideload them into that profile. `--xpi` is the same.
+
+```bash
+bin/vmagent firefox --dir /tmp/vm-gui open https://www.youtube.com/
+bin/vmagent firefox --dir /tmp/vm-gui open --xpi ./uBlock0.firefox.xpi https://www.youtube.com/
+bin/vmagent firefox --dir /tmp/vm-gui open ./uBlock0.firefox.xpi https://www.youtube.com/
+bin/vmagent firefox --dir /tmp/vm-gui tabs
+bin/vmagent firefox --dir /tmp/vm-gui goto https://example.com/
+bin/vmagent firefox --dir /tmp/vm-gui eval 'document.title'
+bin/vmagent firefox --dir /tmp/vm-gui click 100 200
+bin/vmagent firefox --dir /tmp/vm-gui type hello
+bin/vmagent firefox --dir /tmp/vm-gui key a
+bin/vmagent firefox --dir /tmp/vm-gui screenshot
+bin/vmagent firefox --dir /tmp/vm-gui close
+```
+
+`open` with one URL is one tab. Extra URLs are extra tabs. `tabs` marks the active tab with `*`. `close` with no id closes every tab except that one. `close <id>` closes that tab.
+
+## 6. SSH and copy files
 
 Each `--dir` gets a stable MAC. `ssh` and `scp` look that MAC up in `arp -an` and replace `vm` with the guest address. `no address` means the guest is not up yet. Password is `debian`.
 
@@ -64,7 +86,7 @@ bin/vmagent scp --dir /tmp/vm /tmp/hello debian@vm:/tmp/hello
 bin/vmagent ssh --dir /tmp/vm debian@vm cat /tmp/hello
 ```
 
-## 6. List, reattach, stop
+## 7. List, reattach, stop
 
 ```bash
 bin/vmagent list
@@ -74,7 +96,7 @@ bin/vmagent stop --dir /tmp/vm
 
 `list` reads running `vmcore` processes. `attach` opens the window. `stop` kills the VM. `list --json` is what the manager GUI uses.
 
-## 7. Manager GUI
+## 8. Manager GUI
 
 Rust still does setup. SwiftUI (`gui/`) lists VMs and calls `vmagent`. The guest window is still `vmcore`.
 
@@ -87,7 +109,7 @@ open bin/VMAgent.app
 
 New VMs go in `~/VMs/<name>`. Fetch the Debian image from the VM menu if `images/debian.raw` is missing. Start, attach, stop, and SSH use the same commands as the CLI.
 
-## 8. Run commands and edit files
+## 9. Run commands and edit files
 
 Same ssh session as `debian`. `--sudo` runs as root.
 

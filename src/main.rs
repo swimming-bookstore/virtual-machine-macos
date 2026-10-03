@@ -170,10 +170,10 @@ enum Cmd {
     /// Nothing is typed into the window.
     ///
     /// `open` kills any Firefox this command started, wipes the profile, and
-    /// starts one window. Extra URLs are extra tabs. `.xpi` files, or `--xpi`,
-    /// are sideloaded into that profile. `tabs`, `goto`, `eval`, `click`,
-    /// `type`, `key`, `screenshot`, and `close` talk to the Firefox that is
-    /// already listening.
+    /// starts one window. Extra URLs are extra tabs. `--xpi` sideloads an
+    /// extension into that profile. `tabs`, `goto`, `eval`, `click`, `type`,
+    /// `key`, `screenshot`, and `close` talk to the Firefox that is already
+    /// listening.
     Firefox {
         #[arg(long)]
         dir: PathBuf,
@@ -189,12 +189,12 @@ enum Cmd {
 enum FirefoxAction {
     /// Close the previous window, start a clean one, open these URLs.
     Open {
-        /// Sideload this extension. Repeatable. A trailing `.xpi` is the same.
+        /// Sideload this extension. Repeatable.
         #[arg(long)]
         xpi: Vec<PathBuf>,
-        /// Pages to open, and optional `.xpi` files to sideload.
+        /// Pages to open.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        urls: Vec<String>,
     },
     /// Print id, url, and title of each tab. The active tab is marked.
     Tabs,
@@ -734,27 +734,6 @@ fn firefox_user_js() -> String {
     js
 }
 
-fn is_xpi_path(s: &str) -> bool {
-    Path::new(s)
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("xpi"))
-}
-
-/// URLs to open, and host paths of extensions to sideload.
-fn split_open_args(args: &[String], extra_xpi: &[PathBuf]) -> (Vec<String>, Vec<PathBuf>) {
-    let mut urls = Vec::new();
-    let mut xpis = extra_xpi.to_vec();
-    for a in args {
-        if is_xpi_path(a) {
-            xpis.push(PathBuf::from(a));
-        } else {
-            urls.push(a.clone());
-        }
-    }
-    (urls, xpis)
-}
-
 /// Gecko add-on id from `manifest.json` inside the xpi.
 fn firefox_addon_id(path: &Path) -> String {
     let out = Command::new("python3")
@@ -864,14 +843,13 @@ fn firefox_launch_script(
 
 fn firefox_cmd(dir: &Path, port: u16, action: FirefoxAction) -> ! {
     match action {
-        FirefoxAction::Open { xpi, args } => {
-            let (urls, xpis) = split_open_args(&args, &xpi);
+        FirefoxAction::Open { xpi, urls } => {
             for url in &urls {
                 if !(url.starts_with("http://")
                     || url.starts_with("https://")
                     || url.starts_with("about:"))
                 {
-                    die("firefox open takes http, https, or about: URLs, or .xpi files");
+                    die("firefox open takes http, https, or about: URLs");
                 }
             }
             let Some((display, auth)) = x_session_of(dir) else {
@@ -879,7 +857,7 @@ fn firefox_cmd(dir: &Path, port: u16, action: FirefoxAction) -> ! {
             };
             install_firefox_bidi(dir);
             let mut guest_xpis = Vec::new();
-            for (i, path) in xpis.iter().enumerate() {
+            for (i, path) in xpi.iter().enumerate() {
                 if !path.is_file() {
                     die(&format!("xpi not found: {}", path.display()));
                 }
@@ -1278,26 +1256,6 @@ mod tests {
         );
         assert!(x_session("root 1 1 ? /usr/sbin/sshd").is_none());
         assert!(x_session("").is_none());
-    }
-
-    #[test]
-    fn firefox_open_splits_xpi_and_urls() {
-        let (urls, xpis) = split_open_args(
-            &[
-                "uBlock0.firefox.xpi".into(),
-                "https://www.youtube.com/".into(),
-                "about:blank".into(),
-            ],
-            &[PathBuf::from("extra.xpi")],
-        );
-        assert_eq!(urls, ["https://www.youtube.com/", "about:blank"]);
-        assert_eq!(
-            xpis,
-            [PathBuf::from("extra.xpi"), PathBuf::from("uBlock0.firefox.xpi")]
-        );
-        assert!(is_xpi_path("./addons/foo.XPI"));
-        assert!(is_xpi_path("https://example.com/page.xpi"));
-        assert!(!is_xpi_path("https://example.com/page.html"));
     }
 
     #[test]

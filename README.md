@@ -57,12 +57,11 @@ Close the window and open it again with `bin/vmagent attach --dir /tmp/vm-gui`.
 
 Firefox is a process on the guest, driven over WebDriver BiDi, not by clicking the window. `open` kills the previous window, wipes `~/.cache/vmagent/firefox`, and starts `firefox-esr` on the desktop with `--remote-debugging-port`. Default port is 9333. The port stays inside the guest.
 
-Pass `.xpi` files to `open` to sideload them into that profile. `--xpi` is the same.
+Pass `--xpi` to sideload an extension into that profile. Repeatable.
 
 ```bash
 bin/vmagent firefox --dir /tmp/vm-gui open https://www.youtube.com/
 bin/vmagent firefox --dir /tmp/vm-gui open --xpi ./uBlock0.firefox.xpi https://www.youtube.com/
-bin/vmagent firefox --dir /tmp/vm-gui open ./uBlock0.firefox.xpi https://www.youtube.com/
 bin/vmagent firefox --dir /tmp/vm-gui tabs
 bin/vmagent firefox --dir /tmp/vm-gui goto https://example.com/
 bin/vmagent firefox --dir /tmp/vm-gui eval 'document.title'

@@ -16,6 +16,7 @@ package_reboot_if_required: false
 packages:
   - openssh-server
   - task-xfce-desktop
+  - fonts-noto-cjk
 runcmd:
   - systemctl enable --now ssh
   - systemctl set-default graphical.target
